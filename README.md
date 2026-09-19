@@ -74,7 +74,7 @@ distribution and the AndroidX dependencies. That is a property of the build, not
 
 | Component | Version |
 |---|---|
-| JDK (to run the build) | **17** |
+| JDK (to run the build) | **17 or newer** (verified on 21) |
 | Gradle (via wrapper) | 8.14.2 |
 | Android Gradle Plugin | 8.11.0 |
 | Kotlin | 1.7.10 |
@@ -82,9 +82,11 @@ distribution and the AndroidX dependencies. That is a property of the build, not
 | Declared `minSdk` | 24 (see the effective requirement above) |
 | Application ID | `edu.clarkson.iriscapture` |
 
-JDK 17 is required by Android Gradle Plugin 8.x. The compiled bytecode still targets Java 8
-(`sourceCompatibility` and `targetCompatibility` are 1.8), so the two should not be confused: the
-build fails on JDK 11, and raising `jvmTarget` is not a substitute.
+JDK 17 is the *minimum* required by Android Gradle Plugin 8.x; newer JDKs work as well, and the
+project is verified building on JDK 21 (the JetBrains Runtime bundled with current Android Studio
+releases). The compiled bytecode still targets Java 8 (`sourceCompatibility` and
+`targetCompatibility` are 1.8), so the build JDK and the bytecode target should not be confused:
+the build fails on JDK 11, and raising `jvmTarget` is not a substitute.
 
 Point the build at an Android SDK installation that has `compileSdk 34` installed, either by
 setting `ANDROID_HOME` or by creating a `local.properties` file in the repository root containing
@@ -112,8 +114,9 @@ with `adb install -r app/build/outputs/apk/debug/app-debug.apk`.
 ### Android Studio
 
 Open the repository root as an existing project and let Gradle sync. Confirm that the project JDK
-is 17 (Settings, Build Tools, Gradle, Gradle JDK), select a connected physical device, and run the
-`app` configuration. There is no model file to download and no extra setup step.
+is 17 or newer (Settings, Build Tools, Gradle, Gradle JDK; the bundled JetBrains Runtime, JBR 21 in
+current releases, is a valid choice), select a connected physical device, and run the `app`
+configuration. There is no model file to download and no extra setup step.
 
 ---
 
@@ -139,9 +142,11 @@ is 17 (Settings, Build Tools, Gradle, Gradle JDK), select a connected physical d
    announces the switch to the left eye. Accepted and rejected attempts are both reported on
    screen, rejected ones with a reason.
 
-   Three toggles sit on the capture screen: `R` enables or disables RAW capture (enabled by
-   default), `MF` switches to manual focus at the minimum focus distance, and `B` selects the
-   legacy burst path, which is retained but not used by the main flow.
+   One toggle is visible on the capture screen, and only in Telephoto mode: `MF` switches to
+   manual focus at the minimum focus distance. RAW capture is on by default and its `R` button is
+   hidden in every mode. The `B` button is inert: the burst-capture and focus-bracketing paths it
+   used to select were unreachable and were deleted in September 2026, and the button is hidden in
+   every mode. The live path is a single capture per attempt.
 
 ---
 
@@ -193,16 +198,20 @@ back to the cropped JPEG. Full field listings are in
 ## Quality assessment
 
 Before an image is kept it passes through a multi-stage gate: a heuristic eye-presence check that
-rejects frames containing no eye, a sharpness measure combining Laplacian variance and Tenengrad
-gradient energy, and a composite quality score built from several sub-measures, some of which must
-also pass individually. An image is written only if every stage passes; otherwise it is discarded
-together with its pending RAW frame and the loop retries. The composite score is recorded in the
-filename and in the embedded metadata.
+rejects frames containing no eye, a sharpness measure (the variance of the Laplacian response,
+computed over the centre 50 percent of the cropped eye region), and a composite quality score
+built from six sub-measures, three of which must also pass individually. An image is written only
+if every stage passes; otherwise it is discarded together with its pending RAW frame and the loop
+retries. The composite score is recorded in the filename and in the embedded metadata.
 
 The implementation describes itself as "ISO/IEC 29794-6 inspired". **It is not a conformant
 implementation of that standard, and no conformance is claimed here.** Several of the individual
-measures are currently under review and revision, and their behavior should not be inferred from
-their names. Anyone relying on these figures should read the current definitions in
+measures were revised in September 2026: one was removed outright because it returned a constant,
+one was corrected because its formula could not detect what it claimed to measure, and one was
+found to be documented as something it never computed. Their behavior should not be inferred from
+their names, and composite scores produced before and after that revision are not comparable with
+each other. One threshold (motion blur) is currently a reasoned starting value awaiting empirical
+re-tuning. Anyone relying on these figures should read the current definitions in
 [`IrisCapture_Documentation.md`](IrisCapture_Documentation.md) and the source directly, and should
 treat the composite score as an acceptance gate internal to this tool rather than as a
 standardized quality value.

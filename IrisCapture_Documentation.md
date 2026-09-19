@@ -1,7 +1,7 @@
 # IrisCapture - Comprehensive Application Documentation
 
 **Version:** 1.0
-**Date:** February 2026
+**Date:** February 2026, last revised 2026-09-19 (see [Changelog](#27-changelog))
 **Platform:** Android (minSdk 24, targetSdk 34, compileSdk 34)
 **Language:** Kotlin 1.7.10
 **Build System:** Gradle 8.14.2, AGP 8.11.0
@@ -26,7 +26,7 @@
 14. [Eye Image Cropper](#14-eye-image-cropper)
 15. [Eye Presence Detector](#15-eye-presence-detector)
 16. [Sharpness Analyzer](#16-sharpness-analyzer)
-17. [ISO 29794-6 Quality Assessor](#17-iso-29794-6-quality-assessor)
+17. [Iris Quality Assessor (ISO 29794-6 Inspired)](#17-iris-quality-assessor-iso-29794-6-inspired)
 18. [Iris Metadata & EXIF Embedding](#18-iris-metadata--exif-embedding)
 19. [RAW (DNG) Capture](#19-raw-dng-capture)
 20. [Overlay View](#20-overlay-view)
@@ -36,6 +36,7 @@
 24. [Configuration Constants Reference](#24-configuration-constants-reference)
 25. [Data Flow Diagram](#25-data-flow-diagram)
 26. [Known Limitations](#26-known-limitations)
+27. [Changelog](#27-changelog)
 
 ---
 
@@ -48,8 +49,8 @@ IrisCapture is an Android application designed for research-grade iris biometric
 - Camera2 API for full manual control over focus, exposure, ISO, and OIS
 - 3 capture modes: Telephoto, Main Camera, Front Camera
 - 5-signal heuristic eye presence detection (no false saves on backgrounds)
-- ISO 29794-6 inspired quality assessment (7 metrics)
-- Combined Laplacian + Tenengrad sharpness analysis
+- ISO 29794-6 inspired quality assessment (6 metrics; a 7th, gaze angle, was removed on 2026-09-19)
+- Laplacian variance sharpness analysis
 - Dual-format output: cropped JPEG + full-sensor RAW (DNG) with embedded metadata
 - Configurable images per eye (1-20, default 5)
 - Automatic right-eye-then-left-eye session management
@@ -109,23 +110,23 @@ CameraFragment
 
 | File | Lines | Description |
 |------|-------|-------------|
-| `MainActivity.kt` | 37 | Single-activity host with ViewBinding |
-| `MainViewModel.kt` | 39 | Shared ViewModel: participantId, imagesPerEye |
-| `IrisMetadata.kt` | 200 | EXIF-embeddable metadata data class with JSON serialization |
-| `EyeImageCropper.kt` | 220 | BitmapRegionDecoder-based ROI extraction with EXIF rotation handling |
-| `EyePresenceDetector.kt` | 703 | 5-signal heuristic eye detection (no ML) |
-| `SharpnessAnalyzer.kt` | 388 | Laplacian + Tenengrad combined sharpness scoring |
-| `IrisQualityAssessor.kt` | 698 | ISO 29794-6 inspired quality assessment (7 metrics) |
-| `OverlayView.kt` | 390 | Custom View for iris target, crosshair, quality panel |
+| `MainActivity.kt` | 36 | Single-activity host with ViewBinding |
+| `MainViewModel.kt` | 32 | Shared ViewModel: participantId, imagesPerEye |
+| `IrisMetadata.kt` | 199 | EXIF-embeddable metadata data class with JSON serialization |
+| `EyeImageCropper.kt` | 211 | BitmapRegionDecoder-based ROI extraction with EXIF rotation handling |
+| `EyePresenceDetector.kt` | 672 | 5-signal heuristic eye detection (no ML) |
+| `SharpnessAnalyzer.kt` | 128 | Laplacian variance sharpness scoring |
+| `IrisQualityAssessor.kt` | 720 | ISO 29794-6 inspired quality assessment (6 metrics) |
+| `OverlayView.kt` | 391 | Custom View for iris target, crosshair, quality panel |
 
 ### Fragment Files (`fragment/`)
 
 | File | Lines | Description |
 |------|-------|-------------|
-| `LoginFragment.kt` | 58 | Participant ID and images-per-eye input |
-| `PermissionsFragment.kt` | 93 | Camera permission request |
-| `ModeSelectionFragment.kt` | 75 | Capture mode selection cards |
-| `CameraFragment.kt` | ~3584 | Main camera pipeline, capture loop, focus, save |
+| `LoginFragment.kt` | 48 | Participant ID and images-per-eye input |
+| `PermissionsFragment.kt` | 92 | Camera permission request |
+| `ModeSelectionFragment.kt` | 74 | Capture mode selection cards |
+| `CameraFragment.kt` | ~3039 | Main camera pipeline, capture loop, focus, save |
 
 ### Layout Files (`res/layout/`)
 
@@ -178,8 +179,8 @@ powershell.exe -Command ".\gradlew.bat assembleDebug 2>&1"
 **File:** `LoginFragment.kt` + `fragment_login.xml`
 
 ### UI Elements
-- **Participant ID:** `EditText` — 3-digit numeric ID (validated: exactly 3 characters)
-- **Images per Eye:** `EditText` — number input, range 1-20, default 5
+- **Participant ID:** `EditText`, 3-digit numeric ID (validated: exactly 3 characters)
+- **Images per Eye:** `EditText`, number input, range 1-20, default 5
 - **Enter Button:** Validates inputs, stores in `MainViewModel`, navigates to permissions
 
 ### Validation Rules
@@ -219,7 +220,7 @@ Each card navigates to `CameraFragment` with a `capture_mode` argument bundle.
 
 ## 8. Camera Fragment - Core Pipeline
 
-**File:** `CameraFragment.kt` (~3584 lines)
+**File:** `CameraFragment.kt` (~3039 lines)
 
 ### Overall Pipeline (per attempt)
 
@@ -235,8 +236,8 @@ Each card navigates to `CameraFragment` with a `capture_mode` argument bundle.
    f. Single JPEG+RAW capture at 1x zoom (full sensor)
    g. EyeImageCropper.cropFromStoredCoordinates() → BitmapRegionDecoder ROI
    h. EyePresenceDetector.detect() → 5-signal eye validation
-   i. SharpnessAnalyzer.calculateSharpness() → Laplacian+Tenengrad
-   j. IrisQualityAssessor.assess() → 7 ISO metrics
+   i. SharpnessAnalyzer.calculateSharpness() → Laplacian variance
+   j. IrisQualityAssessor.assess() → 6 quality metrics
    k. If all pass: save cropped JPEG (with EXIF metadata) + RAW DNG (parallel)
    l. If fail: discard, show status, retry
    m. Flash OFF, release AE/AWB locks
@@ -269,12 +270,13 @@ Each card navigates to `CameraFragment` with a `capture_mode` argument bundle.
 
 - **Lens selection:** Physical telephoto (focal > 12mm) if available, otherwise zoom-based switching (3x)
 - **Preview zoom:** `telephotoZoomLevel` (1x physical or 3x zoom-based)
-- **Capture zoom:** 1x (full sensor) — iris coordinates map preview-to-capture
+- **Capture zoom:** 1x (full sensor); iris coordinates map preview-to-capture
 - **Focus:** Auto with 6% metering region, or Manual at minimum focus distance
 - **Flash:** Torch mode on rear cameras, turned on AFTER focus lock
 - **OIS:** Enabled if available (`LENS_OPTICAL_STABILIZATION_MODE_ON`)
 - **ISP bypass:** Edge enhancement OFF, noise reduction OFF, hot pixel OFF, shading OFF
-- **Iris radius:** `0.06f` normalized
+- **Iris radius:** `0.15 / previewZoom` (see "Iris radius derivation" below): `0.15` on a physical
+  telephoto lens driven at 1x, `0.05` when telephoto is reached by 3x zoom on the main camera
 
 ### Mode: Main Camera (`MODE_MAIN_8X`)
 
@@ -284,7 +286,7 @@ Each card navigates to `CameraFragment` with a `capture_mode` argument bundle.
 - **Focus:** Auto with standard metering
 - **Flash:** Torch mode
 - **ISP:** Standard settings (edge HIGH_QUALITY, noise FAST)
-- **Iris radius:** `0.15 / 4.0 = 0.0375f` normalized
+- **Iris radius:** `0.15 / 4.0 = 0.0375` (see "Iris radius derivation" below)
 
 ### Mode: Front Camera (`MODE_FRONT`)
 
@@ -294,8 +296,48 @@ Each card navigates to `CameraFragment` with a `capture_mode` argument bundle.
 - **Focus:** Continuous auto
 - **Flash:** None (no front flash)
 - **ISP:** Standard settings
-- **Iris radius:** `0.05f` normalized
+- **Iris radius:** `0.15 / 1.25 = 0.12` (see "Iris radius derivation" below)
 - **Expand factor:** 1.2x (tighter crop than rear cameras)
+
+### Iris radius derivation
+
+The normalized iris radius handed to `EyeImageCropper` is not a per-mode constant. Until
+2026-09-19 it was a hardcoded `when (captureMode)` block whose values were guesses (only the
+`MAIN_8X` branch had actually been derived); it is now computed in `processAndCropCenterBased()`
+from the zoom the preview is really running at:
+
+```kotlin
+irisNormRadius = MIN_IRIS_SIZE_FRACTION / previewZoom   // MIN_IRIS_SIZE_FRACTION = 0.15f
+```
+
+**Why the division.** The participant aligns their iris to the on-screen target that `OverlayView`
+draws at radius `MIN_IRIS_SIZE_FRACTION` (0.15) of the display frame width, and they see that
+target through the *preview*, which runs at the mode's zoom level. `takeSingleCapture()` however
+forces the still to 1x over the full active array, so every feature in the frame shrinks by the
+preview zoom factor Z when it lands in the still. The correct normalized radius in the captured
+still is therefore the on-screen fraction divided by the preview zoom, not the on-screen fraction
+itself.
+
+**Source of `previewZoom`.** `CONTROL_ZOOM_RATIO` is read back from the live preview request
+(`previewRequestBuilder`), so the value tracks whatever the zoom-selection logic actually applied,
+including the telephoto fallback path where `telephotoZoomLevel` is set to the device's `maxZoom`.
+`CONTROL_ZOOM_RATIO` only exists from API 30, so below that the code falls back to the per-mode
+zoom constant the mode asks `setZoom()` for. A final guard catches an unset, zero, negative or NaN
+zoom by falling back to the bare on-screen target size (0.15).
+
+**Values before and after the correction:**
+
+| Mode | Preview zoom | Old (hardcoded) | Current (derived) |
+|------|--------------|-----------------|-------------------|
+| Telephoto, physical lens | 1.0x | 0.06 | **0.15** |
+| Telephoto, zoom-based | 3.0x | 0.06 | **0.05** |
+| Telephoto, fallback device | `maxZoom` | 0.06 | **0.15 / maxZoom** |
+| Main Camera | 4.0x | 0.0375 | 0.0375 (unchanged) |
+| Front Camera | 1.25x | 0.05 | **0.12** |
+
+This radius drives every polar sampling grid in `IrisQualityAssessor` as well as the crop
+rectangle, so the corrected values change quality scores on all modes except `MAIN_8X`. The
+derived values still need confirmation against real captures on a device.
 
 ---
 
@@ -370,8 +412,9 @@ while (qualityCount < targetQualityImagesPerEye &&
        isAutomatedCaptureRunning &&
        (elapsedTime) < totalSessionTimeoutMs) {
 
-    val qualityFromBurst = performTelephotoCaptureSingle(isRightEye, attemptCount)
-    qualityCount += qualityFromBurst  // 0 or 1
+    val qualityFromBurst = performTelephotoCaptureSingle(isRightEye)
+    qualityCount += qualityFromBurst  // 0 or 1; the variable name is a leftover,
+                                      // the call performs a single capture
 
     if (needsMore) delay(500)  // Inter-attempt pause
 }
@@ -568,41 +611,51 @@ eyeDetected = (composite >= 0.28) AND geometricPass
 
 ### Eye Color Robustness
 - **Dark irises:** Geometric signals (1, 2) detect iris-sclera boundary regardless of iris color. Sclera contrast still works (sclera is always lighter than iris).
-- **Light irises:** Actually easier — stronger limbal contrast with both sclera and pupil.
+- **Light irises:** Actually easier, with stronger limbal contrast with both sclera and pupil.
 - **Light skin:** Sclera detection requires brightness contrast (30+) between center and flanks, preventing false positives from light skin.
 
 ---
 
 ## 16. Sharpness Analyzer
 
-**File:** `SharpnessAnalyzer.kt` (388 lines)
+**File:** `SharpnessAnalyzer.kt` (128 lines)
 **Type:** `object` singleton
 
-### Algorithms
+### Algorithm
 
-**1. Laplacian Variance**
+There is exactly one sharpness metric: **the variance of the Laplacian response**.
+
 - Kernel: `[0, 1, 0; 1, -4, 1; 0, 1, 0]`
-- Score = variance of Laplacian response across ROI
-- Detects edges/rapid intensity change — sharper images have higher variance
+- Score = variance of the Laplacian response across the ROI
+- The Laplacian highlights rapid intensity change (edges), so a sharper image produces a
+  wider spread of responses and a higher variance
+- Grayscale conversion uses the standard luminance weights (0.299 R, 0.587 G, 0.114 B)
 
-**2. Tenengrad (Sobel Gradient Magnitude)**
-- Sobel X and Y gradients
-- Score = mean squared gradient magnitude, normalized by /100
-- More robust for fine iris micro-texture detection
+### Region of Interest
 
-**Combined score:** `0.3 × Laplacian + 0.7 × Tenengrad`
+`calculateSharpness()` takes an optional `roiRect`. The live capture path passes `null`, so the
+ROI defaults to the **centre 50 percent** of the supplied bitmap (`width/4 .. 3*width/4` by
+`height/4 .. 3*height/4`). The bitmap it is given is already the cropped eye region produced by
+`EyeImageCropper`, so the measured area is the middle of the eye crop, which is where the iris
+sits. The ROI is clamped to the bitmap bounds and the call returns 0.0 if fewer than 3 pixels
+remain on a side.
 
-### Iris-Specific Sharpness (`calculateSharpnessForIris()`)
+The byte-array overload (`calculateSharpness(jpegBytes, roiRect)`) decodes with
+`inSampleSize = 2` before measuring. It is not used by the live capture path.
 
-**Optimized path for iris capture:**
-1. Read JPEG dimensions without full decode
-2. Transform display-space iris coordinates to raw pixel space (using EXIF rotation)
-3. Compute ROI rectangle (iris center ± 1.5x iris radius)
-4. **BitmapRegionDecoder:** Decode ONLY the ROI (not full 12MP image)
-5. Sample size: 1 for ROI < 1MP, 2 for < 4MP, 4 otherwise
-6. Run combined sharpness on the decoded ROI bitmap
+### Correction on 2026-09-19: the Tenengrad blend never ran
 
-**Performance:** Saves ~200-300ms per call compared to full-image decode.
+Earlier revisions of this document described a combined score of
+`0.3 x Laplacian + 0.7 x Tenengrad`, computed by `calculateSharpnessForIris()` /
+`calculateCombinedSharpness()` with a `BitmapRegionDecoder` ROI-only decode path. **That blend was
+never on the live path.** Its only caller was the burst-capture path, which had no reachable entry
+point (see section 26), so the metric actually gating every capture was, and still is, plain
+Laplacian variance. The blend, the Tenengrad implementation, the `LAPLACIAN_WEIGHT` /
+`TENENGRAD_WEIGHT` constants and the iris-specific decode path have been deleted rather than left
+in place looking like the metric in use.
+
+The thresholds below are unaffected: they were always tuned against plain Laplacian variance, so
+they remain valid. Do not blend another score into this metric without re-tuning them.
 
 ### Sharpness Thresholds
 
@@ -613,22 +666,51 @@ eyeDetected = (composite >= 0.28) AND geometricPass
 
 ---
 
-## 17. ISO 29794-6 Quality Assessor
+## 17. Iris Quality Assessor (ISO 29794-6 Inspired)
 
-**File:** `IrisQualityAssessor.kt` (698 lines)
+**File:** `IrisQualityAssessor.kt` (720 lines)
 **Type:** `object` singleton
 
-### Seven Quality Metrics
+The source describes itself as "ISO 29794-6 inspired". This is **not** a conformant implementation
+of that standard and no conformance is claimed. Treat the composite score as an acceptance gate
+internal to this application.
+
+### Six Quality Metrics
 
 | # | Metric | Weight | Critical | Threshold | Description |
 |---|--------|--------|----------|-----------|-------------|
-| 1 | Usable Iris Area | 0.20 | Yes | 50% (rear), 35% (front) | Fraction of iris annulus not occluded by eyelids |
-| 2 | Gaze Angle | 0.10 | Yes | ≤ 0.25 displacement | Iris center vs eye midpoint offset |
-| 3 | Pupil-to-Iris Ratio | 0.10 | No | 0.20 - 0.70 | Optimal at 0.45 |
-| 4 | Iris-Pupil Contrast | 0.15 | Yes | ≥ 0.40 (rear), ≥ 0.10 (front) | Weber contrast between pupil and iris zones |
-| 5 | Illumination Uniformity | 0.10 | No | ≥ 0.50 | 8-sector angular uniformity, specular penalty |
-| 6 | Motion Blur | 0.15 | No | ≤ 4.0 anisotropy | Gradient direction histogram peak/mean ratio |
-| 7 | Sharpness | 0.20 | Yes | Mode-specific (see above) | Reuses SharpnessAnalyzer score |
+| 1 | Usable Iris Area | 0.2222 | Yes | 50% (rear), 35% (front) | Fraction of iris annulus not occluded by eyelids |
+| 2 | Pupil-to-Iris Ratio | 0.1111 | No | 0.20 - 0.70 | Optimal at 0.45 |
+| 3 | Iris-Pupil Contrast | 0.1667 | Yes | ≥ 0.40 (rear), ≥ 0.10 (front) | Weber contrast between pupil and iris zones |
+| 4 | Illumination Uniformity | 0.1111 | No | ≥ 0.50 | 8-sector angular uniformity, specular penalty |
+| 5 | Motion Blur | 0.1667 | No | ≤ 6.0 anisotropy (provisional) | Gradient orientation histogram peak / full-histogram mean |
+| 6 | Sharpness | 0.2222 | Yes | Mode-specific (see section 16) | Reuses the SharpnessAnalyzer score |
+
+The weights sum to 1.0, so the composite stays on a 0 to 100 scale.
+
+### Removed on 2026-09-19: Gaze Angle
+
+A seventh metric, **Gaze Angle** (weight 0.10, critical, threshold 0.25 displacement), used to sit
+between metrics 1 and 2. It measured the offset of the iris centre from the midpoint of the eye
+corners, normalized by eye width, which requires eyelid landmarks. Those landmarks disappeared when
+MediaPipe was removed: `EyeImageCropper` always passes `upperEyelidPoints = lowerEyelidPoints =
+null`, so `computeGazeAngle()` returned a hard-coded `0.15f` on every image. That produced a
+constant normalized score of exactly 70.0, a critical gate that could never fail, and a fixed
+contribution of +7.0 to every composite score.
+
+The metric, its `computeGazeAngle()` implementation and its `GAZE_DISPLACEMENT_THRESHOLD` constant
+were deleted. The six surviving weights were **renormalised by dividing each by 0.90** (the weight
+sum left after removing gaze), so they still add to 1.0 and `COMPOSITE_PASS_THRESHOLD` remains
+meaningful at `40f` on the same 0 to 100 scale:
+
+| Old weight | New weight | Metrics |
+|------------|------------|---------|
+| 0.20 | 0.2222 | Usable Iris, Sharpness |
+| 0.15 | 0.1667 | Contrast, Motion Blur |
+| 0.10 | 0.1111 | Pupil Ratio, Uniformity |
+
+If eyelid landmarks ever become available again, the metric can be re-added and the weights
+renormalised once more.
 
 ### Pass/Fail Logic
 
@@ -638,7 +720,8 @@ allCriticalPassed = all critical metrics individually pass
 overallPassed = (compositeScore >= 40) AND allCriticalPassed
 ```
 
-**Critical metrics (must ALL pass individually):** Usable Iris, Gaze Angle, Contrast, Sharpness.
+**Critical metrics (must ALL pass individually), three of them:** Usable Iris, Contrast,
+Sharpness. Gaze Angle used to be the fourth.
 
 ### Metric Details
 
@@ -648,29 +731,70 @@ overallPassed = (compositeScore >= 40) AND allCriticalPassed
   - Rear camera threshold: intensity < 180 (flash makes iris darker)
   - Front camera threshold: intensity < 220 (ambient light makes iris brighter)
 
-#### Metric 2: Gaze Angle
-- Without landmarks: Returns 0.15 (moderate score, ~70/100)
-- With landmarks: Computes iris center offset from eye corner midpoint, normalized by eye width
-
-#### Metric 3: Pupil-to-Iris Ratio
+#### Metric 2: Pupil-to-Iris Ratio
 - Radial intensity profile from iris center outward (36 angles × 20 radial steps)
 - Peak gradient = pupil-iris boundary
 - Optimal: 0.45 (center of 0.20-0.70 range)
 
-#### Metric 4: Iris-Pupil Contrast
+#### Metric 3: Iris-Pupil Contrast
 - Weber contrast: `|meanIris - meanPupil| / (meanPupil + 1)`
 - Samples inner 80% of pupil zone and iris annulus separately
 
-#### Metric 5: Illumination Uniformity
+#### Metric 4: Illumination Uniformity
 - Divides iris annulus into 8 angular sectors
 - Uniformity = `1 - (maxSectorMean - minSectorMean) / (maxSectorMean + 1)`
 - Specular penalty: pixels > 242 brightness
 
-#### Metric 6: Motion Blur
-- 36-bin gradient direction histogram (10-degree bins) weighted by gradient magnitude
-- Anisotropy = peak / mean of non-zero bins
-- Low anisotropy = sharp (uniform gradient directions)
-- High anisotropy = motion blur (dominant directional streak)
+#### Metric 5: Motion Blur (corrected 2026-09-19)
+
+Gradient orientation anisotropy over the iris bounding box, weighted by gradient magnitude:
+
+- **36 bins over `[0, pi)`**, so each bin spans **5 degrees**. Gradient orientation is mod pi, not
+  mod 2pi, so the `atan2` result is folded into `[0, pi)` before binning.
+- Sobel gradients; samples with magnitude below 5 are skipped. An ROI smaller than 5 by 5 pixels
+  returns the isotropic floor.
+- **Anisotropy = peak bin / mean over the FULL histogram**, giving a range of **1.0** (every bin
+  equal, perfectly isotropic, no directional blur) to **36.0** (all gradient energy in a single
+  5 degree bin, perfectly directional).
+- Low anisotropy = sharp (gradients point every which way). High anisotropy = motion blur (one
+  dominant edge orientation).
+
+**Score mapping** is anchored at the isotropic floor rather than at 0, because 0 is not reachable
+by the metric:
+
+```
+excess   = anisotropy - 1.0                     // 0 at perfect isotropy
+headroom = MOTION_BLUR_THRESHOLD - 1.0          // the excess at the threshold
+score    = (1 - excess / (2 * headroom)) * 100  // clamped to 0..100
+```
+
+So the score is 100 at anisotropy 1.0, exactly 50 at the threshold, 0 at `2 * threshold - 1`
+(11.0 with the current threshold), and decreases monotonically in between.
+
+**Two bugs were fixed here on 2026-09-19:**
+
+1. The mean was taken over the **non-zero bins only**, which cancels exactly the concentration
+   the metric exists to detect. An isotropic histogram (all bins `v`) gave `v / v = 1.0`, and a
+   fully directional one (one bin `V`, the rest zero) also gave `V / V = 1.0`. The metric
+   therefore returned about 1.0 for a sharp image and for a fully motion-blurred one alike, and
+   passed unconditionally. The mean is now taken over the full histogram.
+2. Binning used `atan2` over the full 2pi range although gradient orientation is mod pi, so a
+   single straight edge populated two opposite bins and halved the measured peak. The angle is
+   now folded first. The bin count is unchanged at 36, so bins are 5 degrees wide, not 10.
+
+**`MOTION_BLUR_THRESHOLD` moved from 4.0 to 6.0. This is a provisional, reasoned value, not an
+empirical one, and it requires re-tuning against a real capture set before the metric is trusted.**
+The old threshold of 4.0 carried no information, because the old formula was pinned near 1.0
+regardless of input, so there is no historical baseline to calibrate against. 6.0 means the
+dominant orientation bin carries 6x the mean bin energy, roughly 17 percent of all gradient energy
+inside one 5 degree band, which is a strong directional signature. The in-file comment carries the
+same warning.
+
+#### Metric 6: Sharpness
+- Reuses the `SharpnessAnalyzer` Laplacian variance score computed on the cropped eye image
+- Normalized score = `(sharpness / threshold) * 50`, clamped to 0..100, so the mode threshold
+  maps to exactly 50 and passing the threshold is equivalent to scoring at least 50
+- If the threshold is not positive, the normalized score defaults to 50
 
 ---
 
@@ -759,8 +883,8 @@ data class IrisMetadata(
 {
   "version": "1.0",
   "cropRegion": { "left": 1000, "top": 800, "right": 3000, "bottom": 2200, "width": 2000, "height": 1400 },
-  "irisSensorCoordinates": { "centerX": 2016.0, "centerY": 1512.0, "radius": 181.0 },
-  "irisNormalized": { "x": 0.5, "y": 0.5, "radius": 0.06 },
+  "irisSensorCoordinates": { "centerX": 2016.0, "centerY": 1512.0, "radius": 453.6 },
+  "irisNormalized": { "x": 0.5, "y": 0.5, "radius": 0.15 },
   "sensorInfo": { "width": 4032, "height": 3024, "exifRotationDegrees": 90 },
   "irisMetadata": { ... full IrisMetadata JSON ... }
 }
@@ -792,7 +916,7 @@ takeSingleCapture() → JPEG callback → processAndCropCenterBased()
 | Corner Brackets | With iris target | 4 L-shaped guides around the target |
 | Size Indicator | During preview | "Move CLOSER until iris fills the circle" / "Iris size OK" |
 | Eye Label | During capture | "Position RIGHT EYE in the circle" |
-| Quality Panel | After quality pass | Semi-transparent black panel showing ISO metric scores |
+| Quality Panel | After quality pass | Semi-transparent black panel showing the six quality metric scores |
 | Center Crosshair | When no iris target | Simple green crosshair (+) at center |
 | Focus Ring | During focus | Green rectangle around focus area |
 
@@ -803,7 +927,6 @@ takeSingleCapture() → JPEG callback → processAndCropCenterBased()
 │ IRIS QUALITY: 72/100 PASS│
 │─────────────────────────│
 │ Usable Iris   92   PASS │
-│ Gaze Angle    70   PASS │
 │ Pupil Ratio   85   PASS │
 │ Contrast      65   PASS │
 │ Uniformity    78   PASS │
@@ -812,7 +935,9 @@ takeSingleCapture() → JPEG callback → processAndCropCenterBased()
 └─────────────────────────┘
 ```
 
-Auto-hides after 3 seconds (single capture) or 5 seconds (burst).
+The rows are rendered from `qualityResult.metrics` in list order, so the panel now shows six rows:
+the Gaze Angle row disappeared with the metric on 2026-09-19. The panel auto-hides 3 seconds after
+a quality image is saved.
 
 ---
 
@@ -860,14 +985,14 @@ Uses `ContentResolver` with `MediaStore.Images.Media.EXTERNAL_CONTENT_URI`. On A
 
 | Phase | Duration | Optimization |
 |-------|----------|--------------|
-| Alignment delay | 4000ms (first) / 500ms (subsequent) | Adaptive — user already positioned after first attempt |
+| Alignment delay | 4000ms (first) / 500ms (subsequent) | Adaptive: user already positioned after first attempt |
 | Focus settling | 300-500ms (first) / skipped (subsequent) | AF runs during alignment delay |
 | Focus lock | ≤2000ms | Reduced timeout from 3000ms, 2 retries (down from 3) |
 | Flash stabilization | 150ms | Reduced from 1000ms (minimize pupil constriction) |
 | Capture | ~200ms | Single shot |
 | Eye crop | ~50-100ms | BitmapRegionDecoder (ROI only, not full 12MP) |
 | Eye presence check | ~5-10ms | Shared grayscale, efficient sampling |
-| Sharpness | ~30-50ms | Laplacian+Tenengrad single pass with shared grayscale |
+| Sharpness | ~30-50ms | Single Laplacian pass over the centre 50% of the already-cropped eye image |
 | Quality assessment | ~20-40ms | Polar grid sampling |
 | JPEG save | ~50ms | MediaStore ContentResolver |
 | RAW save | ~1-3s | Parallel with JPEG via coroutine async |
@@ -876,8 +1001,10 @@ Uses `ContentResolver` with `MediaStore.Images.Media.EXTERNAL_CONTENT_URI`. On A
 **Estimated total per attempt:** ~1.5s (subsequent) to ~5s (first)
 
 ### Memory Optimizations
-- **BitmapRegionDecoder** for all ROI extraction (never decodes full 12MP image into memory)
-- **Shared grayscale arrays** between Laplacian and Tenengrad (single conversion)
+- **BitmapRegionDecoder** for ROI extraction in `EyeImageCropper` (never decodes the full 12MP
+  image into memory)
+- **Sharpness runs on the already-cropped eye bitmap**, so it needs no decode of its own (the
+  separate ROI-decoding sharpness path was deleted on 2026-09-19 as unreachable)
 - **Shared pixel/grayscale arrays** in EyePresenceDetector across all 5 signals
 - **Bitmap recycling** after save completes (both JPEG and RAW)
 - **Parallel JPEG + RAW saves** via `coroutineScope { async {} }`
@@ -921,6 +1048,7 @@ Uses narrowest-FOV front camera (largest focal length) to avoid ultra-wide selfi
 | `FOCUS_RETRY_COUNT` | 2 | AF retries before proceeding |
 | `AF_METERING_FRACTION` | 12 (1/12 = ~8%) | Standard metering region |
 | `AF_METERING_FRACTION_TELEPHOTO` | 16 (1/16 = ~6%) | Telephoto metering region |
+| `MIN_IRIS_SIZE_FRACTION` | 0.15 | On-screen iris target radius; also the numerator of the iris radius derivation (section 9) |
 
 ### Sharpness Thresholds
 
@@ -943,8 +1071,6 @@ Uses narrowest-FOV front camera (largest focal length) to avoid ultra-wide selfi
 
 | Constant | Value | Description |
 |----------|-------|-------------|
-| `FOCUS_BRACKET_STEPS` | 5 | Focus bracketing: number of distances |
-| `FOCUS_BRACKET_STEP_DIOPTERS` | 0.3 | Bracket step size in diopters |
 | `FLASH_STABILIZATION_DELAY_MS` | 150 | Time after flash before capture |
 | `POST_FLASH_CAPTURE_DELAY_MS` | 50 | Brief delay post-flash |
 | `USE_OIS_FOR_TELEPHOTO` | true | Enable OIS for telephoto |
@@ -968,12 +1094,15 @@ Uses narrowest-FOV front camera (largest focal length) to avoid ultra-wide selfi
 |----------|-------|-------------|
 | `USABLE_IRIS_THRESHOLD` | 0.50 | Rear camera usable iris minimum |
 | `USABLE_IRIS_THRESHOLD_FRONT` | 0.35 | Front camera usable iris minimum |
-| `GAZE_DISPLACEMENT_THRESHOLD` | 0.25 | Maximum gaze offset |
 | `PUPIL_RATIO_MIN` / `MAX` | 0.20 / 0.70 | Valid pupil-to-iris ratio range |
 | `CONTRAST_THRESHOLD` | 0.40 | Minimum iris-pupil contrast |
 | `UNIFORMITY_THRESHOLD` | 0.50 | Minimum illumination uniformity |
-| `MOTION_BLUR_THRESHOLD` | 4.0 | Maximum gradient anisotropy |
+| `MOTION_BLUR_THRESHOLD` | 6.0 | Maximum gradient anisotropy. **Provisional, needs empirical re-tuning** (was 4.0, a value that carried no information because the old formula was degenerate) |
+| `MOTION_BLUR_NUM_BINS` | 36 | Orientation bins over `[0, pi)`, 5 degrees each; also the metric's upper bound |
+| `MOTION_BLUR_ISOTROPIC` | 1.0 | The metric's lower bound, a perfectly isotropic histogram |
 | `COMPOSITE_PASS_THRESHOLD` | 40 | Minimum weighted composite score |
+
+`GAZE_DISPLACEMENT_THRESHOLD` (0.25) was deleted on 2026-09-19 with the Gaze Angle metric.
 
 ---
 
@@ -1001,13 +1130,13 @@ Uses narrowest-FOV front camera (largest focal length) to avoid ultra-wide selfi
        │ [If NOT detected → reject, show "No eye detected"]
        ▼
 ┌─────────────────────┐
-│ SharpnessAnalyzer   │──── Laplacian + Tenengrad (~30-50ms)
-│ calculateSharpness()│     Single-pass shared grayscale
+│ SharpnessAnalyzer   │──── Laplacian variance (~30-50ms)
+│ calculateSharpness()│     Centre 50% of the eye crop
 └──────┬──────────────┘
        │ sharpness score (double)
        ▼
 ┌─────────────────────┐
-│ IrisQualityAssessor │──── 7 ISO metrics (~20-40ms)
+│ IrisQualityAssessor │──── 6 quality metrics (~20-40ms)
 │ assess()            │     Composite + critical check
 └──────┬──────────────┘
        │ IrisQualityResult (pass/fail + scores)
@@ -1040,11 +1169,11 @@ Uses narrowest-FOV front camera (largest focal length) to avoid ultra-wide selfi
 
 3. **Eye presence detector tuning:** The composite threshold (0.28) and geometric veto threshold (0.10) may need adjustment for specific capture conditions (e.g., very dark environments, extreme close-up distances).
 
-4. **No eyelid landmark detection:** Since MediaPipe was removed, the quality assessor uses intensity-based fallback for usable iris area estimation instead of precise eyelid polylines. Gaze angle defaults to a moderate score (0.15) without landmarks.
+4. **No eyelid landmark detection:** Since MediaPipe was removed, the quality assessor uses the intensity-based fallback for usable iris area estimation instead of precise eyelid polylines. The landmark path in `computeUsableIrisArea()` is retained but is never taken, because `EyeImageCropper` always passes null eyelid point lists. The Gaze Angle metric depended entirely on those landmarks and was removed on 2026-09-19 rather than left returning a constant (see section 17).
 
 5. **Front camera limitations:** No flash available, lower sharpness thresholds, wider contrast tolerance. Front camera images are inherently lower quality than rear cameras for iris capture.
 
-6. **Burst mode is legacy:** The primary capture path is single-capture (`takeSingleCapture` → `processAndCropCenterBased`). Burst capture (`takeBurstWithBestFrame`) and focus bracketing (`takeFocusBracketBurst`) code is retained but not actively used in the main flow.
+6. **Burst and focus-bracket paths are gone:** The only capture path is single-capture (`takeSingleCapture` → `processAndCropCenterBased`). The burst path (`takeBurstWithBestFrame`), the focus-bracketing path (`takeFocusBracketBurst`) and their `FOCUS_BRACKET_*` constants were deleted on 2026-09-19 after their unreachability was established: the `B` button only toggles its own colour, `setupModeUI()` sets it to `View.GONE` in every mode, and the burst-active flag could never become true. The burst path was also already broken, since the iris coordinates it fed to the sharpness analyzer were never assigned anywhere. `isBurstMode` survives as an unread capture-state flag and the hidden `B` button still toggles it.
 
 7. **RAW not available on all lenses:** Some physical camera IDs (especially telephoto on certain devices) may not support RAW_SENSOR format. The app gracefully falls back to JPEG-only.
 
@@ -1053,3 +1182,54 @@ Uses narrowest-FOV front camera (largest focal length) to avoid ultra-wide selfi
 9. **Package name is legacy:** The package `com.google.mediapipe.examples.facelandmarker` was inherited from the original TensorFlow/MediaPipe codebase. All ML dependencies have been removed, but the package name was retained for compatibility.
 
 10. **Portrait mode only:** All capture modes currently force portrait orientation. The landscape mode constants (`USE_LANDSCAPE_FOR_*`) are all set to `false`.
+
+11. **`MOTION_BLUR_THRESHOLD` is provisional:** The corrected motion-blur metric now spans 1.0 to 36.0, but its threshold of 6.0 is a reasoned starting point rather than a measured one. The previous value could not be carried over, because the formula it was chosen against returned roughly 1.0 for every image, so no historical baseline exists. It must be re-tuned against a real capture set before the metric is trusted.
+
+12. **The derived iris radius needs device validation:** The normalized iris radius is now computed from the live preview zoom (section 9) instead of per-mode literals. The derivation is sound, but the resulting values have not yet been confirmed against real captures, and they moved substantially on two modes (telephoto on a physical lens, 0.06 to 0.15, and front camera, 0.05 to 0.12).
+
+---
+
+## 27. Changelog
+
+### 2026-09-19: four quality-metric defects fixed
+
+All four defects were verified against the source before being fixed. **Composite quality scores
+produced before this date are not comparable with those produced after it:** the Gaze Angle
+metric's fixed +7.0 contribution is gone, every remaining weight scales by 1/0.9, and the
+motion-blur sub-score now varies across its full range instead of sitting in a compressed band.
+Quality figures recorded in filenames (`Q{score}`) and in EXIF metadata carry no marker of which
+scale they were produced on, so date the capture session to tell them apart.
+
+1. **Gaze Angle removed; six metrics remain, not seven.** `computeGazeAngle()` returned a
+   hard-coded `0.15f` whenever eyelid landmarks were absent, and `EyeImageCropper` always passes
+   null for them because MediaPipe was removed. The metric therefore scored exactly 70.0 on every
+   image, and its critical gate could never fail. The metric, its implementation and
+   `GAZE_DISPLACEMENT_THRESHOLD` were deleted. The remaining six weights were renormalised by
+   dividing by 0.90 (0.2222 usable iris, 0.1111 pupil ratio, 0.1667 contrast, 0.1111 uniformity,
+   0.1667 motion blur, 0.2222 sharpness), so they still sum to 1.0, the composite stays on 0..100
+   and `COMPOSITE_PASS_THRESHOLD` remains 40f. The critical-gate set dropped from four metrics to
+   three. See section 17.
+
+2. **Motion blur corrected.** Anisotropy used a mean over non-zero histogram bins only, which
+   returned about 1.0 for a sharp image and for a fully blurred one alike, so the metric passed
+   unconditionally. It now uses the full-histogram mean, and gradient orientation is folded to
+   `[0, pi)` before binning, making the 36 bins 5 degrees wide rather than 10. The value range is
+   now 1.0 (isotropic) to 36.0 (fully directional), and the score mapping was re-anchored to give
+   100 at 1.0 and 50 at the threshold. `MOTION_BLUR_THRESHOLD` moved from 4.0 to 6.0, **a
+   provisional judgement call that requires empirical re-tuning** (see limitation 11). See
+   section 17.
+
+3. **Sharpness documentation corrected; dead code removed.** This document previously described a
+   `0.3 x Laplacian + 0.7 x Tenengrad` blend. **That blend never ran.** The live metric is, and
+   always was, plain Laplacian variance over the centre 50 percent of the crop. The blend, the
+   `LAPLACIAN_WEIGHT` / `TENENGRAD_WEIGHT` constants and the iris-specific ROI decode path were
+   deleted along with the unreachable burst and focus-bracket capture paths that were their only
+   callers. The thresholds (50.0 rear, 20.0 front) are unchanged and remain valid, because they
+   were always tuned against plain Laplacian variance. See sections 16 and 26.
+
+4. **Iris radius derived instead of hardcoded.** The per-mode `when` block was replaced by
+   `MIN_IRIS_SIZE_FRACTION / previewZoom`, reading `CONTROL_ZOOM_RATIO` back from the live preview
+   request, with a per-mode fallback below API 30 and a guard against zero, negative and NaN
+   zooms. Corrected values: telephoto on a physical lens 0.06 to 0.15, front camera 0.05 to 0.12,
+   zoom-based telephoto 0.06 to 0.05, `MAIN_8X` unchanged at 0.0375, and fallback devices now
+   track `maxZoom` instead of a fixed literal. See section 9.
