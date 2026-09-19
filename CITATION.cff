@@ -1,0 +1,43 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it using the metadata in this file."
+title: IrisCapture
+abstract: "Android application for iris biometric image capture."
+type: software
+license: Apache-2.0
+
+# TODO: AUTHORS ARE NOT FINAL. The individual human authors of IrisCapture have
+# TODO: not been determined yet. Before publication, replace or supplement the
+# TODO: entity entry below with one entry per person, in the form:
+# TODO:
+# TODO:   - family-names: "Doe"
+# TODO:     given-names: "Jane"
+# TODO:     affiliation: "Clarkson University"
+# TODO:
+# TODO: The Citation File Format requires at least one author, so the entity
+# TODO: entry below is a placeholder that keeps this file valid in the meantime.
+authors:
+  - name: "Clarkson University"
+
+# TODO: Replace with the final public repository URL before publication.
+repository-code: "https://github.com/TODO-REPLACE-WITH-FINAL-REPOSITORY-URL"
+
+# TODO: PREFERRED CITATION IS NOT FILLED IN. The accompanying research paper is
+# TODO: not yet published, so the block below is commented out on purpose.
+# TODO: A preferred-citation entry requires a real integer "year" and a "doi"
+# TODO: matching the 10.x pattern, so literal TODO strings in those fields would
+# TODO: make this file fail CFF schema validation. Uncomment the block and fill
+# TODO: in every field once the paper details are known.
+#
+# preferred-citation:
+#   type: article              # TODO: "article" or "conference-paper", whichever applies
+#   title: "TODO: paper title"
+#   authors:                   # TODO: replace with the paper's author list
+#     - family-names: "TODO"
+#       given-names: "TODO"
+#       affiliation: "Clarkson University"
+#   journal: "TODO: journal name"
+#   # collection-title: "TODO: proceedings name"   # TODO: use instead of journal for a conference paper
+#   # conference:
+#   #   name: "TODO: conference name"
+#   year: 2026                 # TODO: replace with the real publication year
+#   doi: "10.0000/TODO"        # TODO: replace with the real DOI

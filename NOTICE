@@ -1,0 +1,22 @@
+IrisCapture
+Copyright 2026 Clarkson University
+
+This product is licensed under the Apache License, Version 2.0. A copy of the
+license is included in the LICENSE file at the root of this repository.
+
+This product includes software derived from the "face_landmarker" Android
+example in the google-ai-edge/mediapipe-samples repository
+(https://github.com/google-ai-edge/mediapipe-samples), which is also licensed
+under the Apache License, Version 2.0 and carries the upstream copyright
+notice:
+
+    Copyright 2023 The TensorFlow Authors. All Rights Reserved.
+
+Retained from the upstream example: the Gradle build scaffolding, the
+single-activity Navigation Component structure, and parts of the camera
+fragment skeleton. The upstream Apache License 2.0 file headers are still
+present in 28 files in this repository.
+
+Removed from the upstream example: the MediaPipe and TensorFlow Lite
+dependencies, the model download step, and the face landmark detection
+pipeline.
