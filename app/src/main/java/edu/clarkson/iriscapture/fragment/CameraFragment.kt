@@ -128,8 +128,17 @@ class CameraFragment : Fragment() {
         private const val TARGET_ISO_MAX = 400       // Maximum ISO to limit noise
         private const val MIN_SHUTTER_SPEED_NS = 4_000_000L   // 1/250s = 4ms = 4,000,000 ns
         private const val MAX_SHUTTER_SPEED_NS = 8_000_000L   // 1/125s = 8ms = 8,000,000 ns
-        private const val FOCUS_LOCK_TIMEOUT_MS = 3000L       // Max time to wait for focus lock
-        private const val FOCUS_RETRY_COUNT = 3               // Number of focus retries before proceeding
+        // RESTORED 2026-09-19 from the February optimisation work, lost with the working
+        // tree. The 2000ms timeout is corroborated by the pre-loss compiled build.
+        private const val FOCUS_LOCK_TIMEOUT_MS = 2000L       // Max time to wait for focus lock
+        private const val FOCUS_RETRY_COUNT = 2               // Number of focus retries before proceeding
+
+        // Alignment delay is adaptive: the participant needs time to position on the first
+        // attempt of an eye, but is already aligned on retries. A flat 4s on every attempt
+        // cost roughly 7.7s of fixed delay per attempt against a 30-attempt cap.
+        private const val ALIGNMENT_DELAY_FIRST_MS = 4000L
+        private const val ALIGNMENT_DELAY_SUBSEQUENT_MS = 500L
+        private const val INTER_ATTEMPT_DELAY_MS = 500L
 
         // AF Metering region size (fraction of frame)
         private const val AF_METERING_FRACTION = 12           // 1/12 = ~8% of frame (was 1/4 = 25%)
@@ -1438,7 +1447,7 @@ class CameraFragment : Fragment() {
 
             // Perform the capture (returns number of quality images from this burst)
             // Always use center-based capture (MediaPipe removed)
-            val qualityFromBurst = performTelephotoCaptureSingle(isRightEye)
+            val qualityFromBurst = performTelephotoCaptureSingle(isRightEye, attemptCount == 1)
 
             // Update quality count
             qualityCount += qualityFromBurst
@@ -1456,7 +1465,7 @@ class CameraFragment : Fragment() {
                         showStatus("$eyeLabel Eye: $qualityCount/$TARGET_QUALITY_IMAGES_PER_EYE - continue capturing")
                     }
                 }
-                delay(2000)  // Give user time to reposition if needed
+                delay(INTER_ATTEMPT_DELAY_MS)  // Brief pause before the next attempt
             }
         }
 
@@ -1481,8 +1490,8 @@ class CameraFragment : Fragment() {
      * Single telephoto capture - performs one burst and returns count of quality images.
      * Used by the quality capture loop.
      */
-    private suspend fun performTelephotoCaptureSingle(isRightEye: Boolean): Int {
-        return performTelephotoCapture(isRightEye)
+    private suspend fun performTelephotoCaptureSingle(isRightEye: Boolean, isFirstAttempt: Boolean = true): Int {
+        return performTelephotoCapture(isRightEye, isFirstAttempt)
     }
 
     /**
@@ -1494,7 +1503,7 @@ class CameraFragment : Fragment() {
      * 2. Smaller AF metering region (~6%) for precise iris focus
      * 3. Optional manual focus at minimum distance for largest possible iris
      */
-    private suspend fun performTelephotoCapture(isRightEye: Boolean): Int {
+    private suspend fun performTelephotoCapture(isRightEye: Boolean, isFirstAttempt: Boolean = true): Int {
         val eyeLabel = if (isRightEye) "RIGHT" else "LEFT"
 
         // Calculate recommended distance based on actual lens capability
@@ -1550,8 +1559,11 @@ class CameraFragment : Fragment() {
                 "minFocusDist=${minFocusDistanceCm}cm, recommended=${recommendedDistanceCm}cm, " +
                 "manualFocus=$useManualFocus")
 
-        // Give user time to align and position
-        delay(4000)
+        // Give the participant time to align. Full delay only on the first attempt of an
+        // eye; on retries they are already in position (restored 2026-09-19).
+        val alignmentDelay = if (isFirstAttempt) ALIGNMENT_DELAY_FIRST_MS else ALIGNMENT_DELAY_SUBSEQUENT_MS
+        Log.d(TAG, "TELEPHOTO_CAPTURE: alignment delay ${alignmentDelay}ms (firstAttempt=$isFirstAttempt)")
+        delay(alignmentDelay)
 
         withContext(Dispatchers.Main) {
             showStatus("Focusing on $eyeLabel Eye...")
