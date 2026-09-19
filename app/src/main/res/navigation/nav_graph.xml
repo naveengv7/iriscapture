@@ -21,7 +21,7 @@
 
     <fragment
         android:id="@+id/login_fragment"
-        android:name="com.google.mediapipe.examples.facelandmarker.fragment.LoginFragment"
+        android:name="edu.clarkson.iriscapture.fragment.LoginFragment"
         android:label="LoginFragment">
         <action
             android:id="@+id/action_login_to_permissions"
@@ -30,7 +30,7 @@
 
     <fragment
         android:id="@+id/permissions_fragment"
-        android:name="com.google.mediapipe.examples.facelandmarker.fragment.PermissionsFragment"
+        android:name="edu.clarkson.iriscapture.fragment.PermissionsFragment"
         android:label="PermissionsFragment">
 
         <action
@@ -43,7 +43,7 @@
 
     <fragment
         android:id="@+id/mode_selection_fragment"
-        android:name="com.google.mediapipe.examples.facelandmarker.fragment.ModeSelectionFragment"
+        android:name="edu.clarkson.iriscapture.fragment.ModeSelectionFragment"
         android:label="ModeSelectionFragment">
 
         <action
@@ -60,7 +60,7 @@
 
     <fragment
         android:id="@+id/camera_fragment"
-        android:name="com.google.mediapipe.examples.facelandmarker.fragment.CameraFragment"
+        android:name="edu.clarkson.iriscapture.fragment.CameraFragment"
         android:label="CameraFragment">
 
         <argument

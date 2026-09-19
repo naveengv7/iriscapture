@@ -1,3 +1,4 @@
+package edu.clarkson.iriscapture
 /*
  * Copyright 2023 The TensorFlow Authors. All Rights Reserved.
  *
@@ -13,20 +14,19 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-package com.google.mediapipe.examples.facelandmarker
 
-import org.junit.Test
-
-import org.junit.Assert.*
+import androidx.lifecycle.ViewModel
 
 /**
- * Example local unit test, which will execute on the development machine (host).
- *
- * See [testing documentation](http://d.android.com/tools/testing).
+ * ViewModel for storing app settings (participant ID for iris capture)
  */
-class ExampleUnitTest {
-    @Test
-    fun addition_isCorrect() {
-        assertEquals(4, 2 + 2)
+class MainViewModel : ViewModel() {
+
+    private var _participantId: String = "P001"
+
+    val participantId: String get() = _participantId
+
+    fun setParticipantId(id: String) {
+        _participantId = id
     }
 }

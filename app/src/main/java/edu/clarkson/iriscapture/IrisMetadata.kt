@@ -1,4 +1,4 @@
-package com.google.mediapipe.examples.facelandmarker
+package edu.clarkson.iriscapture
 
 import android.graphics.PointF
 import android.media.ExifInterface

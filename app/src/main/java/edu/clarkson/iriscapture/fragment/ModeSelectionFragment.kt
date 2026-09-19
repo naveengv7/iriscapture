@@ -1,4 +1,4 @@
-package com.google.mediapipe.examples.facelandmarker.fragment
+package edu.clarkson.iriscapture.fragment
 
 import android.os.Bundle
 import android.view.LayoutInflater
@@ -7,9 +7,9 @@ import android.view.ViewGroup
 import androidx.fragment.app.Fragment
 import androidx.fragment.app.activityViewModels
 import androidx.navigation.fragment.findNavController
-import com.google.mediapipe.examples.facelandmarker.MainViewModel
-import com.google.mediapipe.examples.facelandmarker.R
-import com.google.mediapipe.examples.facelandmarker.databinding.FragmentModeSelectionBinding
+import edu.clarkson.iriscapture.MainViewModel
+import edu.clarkson.iriscapture.R
+import edu.clarkson.iriscapture.databinding.FragmentModeSelectionBinding
 
 class ModeSelectionFragment : Fragment() {
 

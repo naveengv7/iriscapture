@@ -1,4 +1,4 @@
-package com.google.mediapipe.examples.facelandmarker
+package edu.clarkson.iriscapture
 
 /*
  * Copyright 2023 The TensorFlow Authors. All Rights Reserved.

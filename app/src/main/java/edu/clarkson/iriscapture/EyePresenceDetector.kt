@@ -4,7 +4,7 @@
 // decompiled bytecode and should be reviewed against intended behavior before relying
 // on this gate for research data.
 
-package com.google.mediapipe.examples.facelandmarker
+package edu.clarkson.iriscapture
 
 import android.graphics.Bitmap
 import android.graphics.PointF

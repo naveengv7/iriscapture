@@ -13,13 +13,14 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-package com.google.mediapipe.examples.facelandmarker.fragment
+package edu.clarkson.iriscapture.fragment
 
 import android.Manifest
-import com.google.mediapipe.examples.facelandmarker.EyeImageCropper
-import com.google.mediapipe.examples.facelandmarker.IrisMetadata
-import com.google.mediapipe.examples.facelandmarker.IrisQualityAssessor
-import com.google.mediapipe.examples.facelandmarker.SharpnessAnalyzer
+import edu.clarkson.iriscapture.EyeImageCropper
+import edu.clarkson.iriscapture.EyePresenceDetector
+import edu.clarkson.iriscapture.IrisMetadata
+import edu.clarkson.iriscapture.IrisQualityAssessor
+import edu.clarkson.iriscapture.SharpnessAnalyzer
 import org.json.JSONObject
 import android.graphics.BitmapFactory
 import android.annotation.SuppressLint
@@ -74,9 +75,9 @@ import androidx.fragment.app.Fragment
 import androidx.fragment.app.activityViewModels
 import androidx.lifecycle.lifecycleScope
 import androidx.navigation.Navigation
-import com.google.mediapipe.examples.facelandmarker.MainViewModel
-import com.google.mediapipe.examples.facelandmarker.R
-import com.google.mediapipe.examples.facelandmarker.databinding.FragmentCameraBinding
+import edu.clarkson.iriscapture.MainViewModel
+import edu.clarkson.iriscapture.R
+import edu.clarkson.iriscapture.databinding.FragmentCameraBinding
 import java.io.File
 import java.io.ByteArrayOutputStream
 import java.io.FileOutputStream
@@ -107,7 +108,7 @@ import kotlin.math.min
 class CameraFragment : Fragment() {
 
     companion object {
-        private const val TAG = "Face Landmarker"
+        private const val TAG = "IrisCapture"
 
         // Capture Modes
         const val MODE_TELEPHOTO = "telephoto"      // 5x optical, manual alignment
@@ -2417,6 +2418,27 @@ class CameraFragment : Fragment() {
         }
         Log.d(TAG, "PROCESS_CROP_CENTER: Cropped eye: ${cropResult.croppedBitmap.width}x${cropResult.croppedBitmap.height}, " +
                 "iris center=${cropResult.irisCenter}, radius=${cropResult.irisRadius}")
+
+        // Step 3.5: Eye-presence gate.
+        // NOTE (2026-09-19): this wiring is RECONSTRUCTED. The original call was
+        // lost with the working tree and was never compiled into any surviving
+        // build, so only its position is known (it sat between the crop and the
+        // sharpness measurement). The rejection behaviour below is a best-faith
+        // reconstruction and should be reviewed against intended behaviour.
+        // Rejecting here avoids running quality assessment on a frame with no eye.
+        val presenceResult = EyePresenceDetector.detect(
+            bitmap = cropResult.croppedBitmap,
+            irisCenter = cropResult.irisCenter,
+            irisRadius = cropResult.irisRadius,
+            isFrontCamera = isFrontCamera
+        )
+        Log.d(TAG, "PROCESS_CROP_CENTER: Eye presence: detected=${presenceResult.eyeDetected} " +
+                "confidence=${presenceResult.confidence} reason=${presenceResult.reason}")
+        if (!presenceResult.eyeDetected) {
+            Log.w(TAG, "PROCESS_CROP_CENTER: Rejected, no eye detected (${presenceResult.reason})")
+            cropResult.croppedBitmap.recycle()
+            return null
+        }
 
         // Step 4: Calculate sharpness on cropped image
         val croppedSharpness = SharpnessAnalyzer.calculateSharpness(cropResult.croppedBitmap, null)

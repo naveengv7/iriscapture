@@ -12,7 +12,7 @@
  * reachable entry point - so it was removed along with that path rather than left to
  * look like the metric in use.
  */
-package com.google.mediapipe.examples.facelandmarker
+package edu.clarkson.iriscapture
 
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
