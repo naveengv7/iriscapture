@@ -46,9 +46,11 @@ IrisCapture is an Android application designed for research-grade iris biometric
 
 **Key characteristics:**
 - Zero ML dependencies (no TensorFlow, no MediaPipe at runtime)
-- Camera2 API used directly for focus, zoom, flash and lens selection. **Manual exposure and
-  ISO are not actually applied:** `SENSOR_SENSITIVITY` and `SENSOR_EXPOSURE_TIME` are set
-  nowhere, and the ISO and shutter constants only appear in a log line (section 24)
+- Camera2 API used directly for focus, zoom, flash, lens selection and capture-side ISP control
+  (telephoto bypasses edge enhancement, noise reduction, hot-pixel correction and shading).
+  **Manual exposure and ISO are still not applied:** `SENSOR_SENSITIVITY` and
+  `SENSOR_EXPOSURE_TIME` are set nowhere, and the ISO and shutter constants only appear in a log
+  line (section 24)
 - 3 capture modes: Telephoto, Main Camera, Front Camera
 - 5-signal heuristic eye presence detection (no false saves on backgrounds)
 - ISO 29794-6 inspired quality assessment (6 metrics; a 7th, gaze angle, was removed on 2026-09-19)
@@ -290,9 +292,10 @@ Each card navigates to `CameraFragment` with a `capture_mode` argument bundle.
 - **Capture zoom:** 1x (full sensor); iris coordinates map preview-to-capture
 - **Focus:** Auto with 6% metering region, or Manual at minimum focus distance
 - **Flash:** Torch mode on rear cameras, turned on AFTER focus lock
-- **OIS:** `LENS_OPTICAL_STABILIZATION_MODE_ON` is applied **to the preview request only**,
-  never to the still capture request (see "ISP and OIS never reached a saved image" below)
-- **ISP bypass:** **not applied.** No saved image has ever had it (see below)
+- **OIS:** `LENS_OPTICAL_STABILIZATION_MODE_ON` on both the preview request and, since
+  2026-09-19, the still capture request, when `hasOisSupport` is true
+- **ISP bypass:** `EDGE_MODE_OFF`, `NOISE_REDUCTION_MODE_OFF`, `HOT_PIXEL_MODE_OFF` and
+  `SHADING_MODE_OFF` on the still request, gated on `DISABLE_ISP_FOR_TELEPHOTO` (see below)
 - **Iris radius:** `0.15 / previewZoom` (see "Iris radius derivation" below): `0.15` on a physical
   telephoto lens driven at 1x, `0.05` when telephoto is reached by 3x zoom on the main camera
 
@@ -303,8 +306,8 @@ Each card navigates to `CameraFragment` with a `capture_mode` argument bundle.
 - **Capture zoom:** 1x (full sensor)
 - **Focus:** Auto with standard metering
 - **Flash:** Torch mode
-- **ISP:** whatever `TEMPLATE_STILL_CAPTURE` defaults to; the app sets no ISP keys on the still
-  request (see below)
+- **ISP:** `EDGE_MODE_HIGH_QUALITY` and `NOISE_REDUCTION_MODE_FAST` on the still request (see
+  below for why `FAST` rather than `MINIMAL`)
 - **Iris radius:** `0.15 / 4.0 = 0.0375` (see "Iris radius derivation" below)
 
 ### Mode: Front Camera (`MODE_FRONT`)
@@ -314,44 +317,85 @@ Each card navigates to `CameraFragment` with a `capture_mode` argument bundle.
 - **Capture zoom:** 1x
 - **Focus:** Continuous auto
 - **Flash:** None (no front flash)
-- **ISP:** whatever `TEMPLATE_STILL_CAPTURE` defaults to; the app sets no ISP keys on the still
-  request (see below)
+- **ISP:** `EDGE_MODE_HIGH_QUALITY` and `NOISE_REDUCTION_MODE_FAST` on the still request, as for
+  Main Camera
 - **Iris radius:** `0.15 / 1.25 = 0.12` (see "Iris radius derivation" below)
 - **Expand factor:** 1.2x (tighter crop than rear cameras)
 
-### ISP and OIS never reached a saved image
+### Capture-side image tuning
 
-**Corrected 2026-09-19.** Earlier revisions of this document listed an ISP bypass and a
-capture-side OIS enable as active tuning on the telephoto mode. **They were never applied to any
-captured image.** `EDGE_MODE_OFF`, `NOISE_REDUCTION_MODE_OFF`, `SHADING_MODE_OFF`, the hot-pixel
-setting, the capture-side OIS enable and the AE/flash copying all lived in
-`applyCommonCaptureSettings()` and `applyOptimalExposureSettings()`, which were only ever reachable
-from the `takePicture` chain. That chain was unreachable and was deleted on 2026-09-19, and the
-helpers went with it. Every image this application has ever saved therefore went through **full ISP
-processing, including denoising and edge enhancement**, which for a study of iris texture is a
-material fact about the existing data as well as about current behaviour.
+#### Historical note: no tuning reached any image captured before 2026-09-19
 
-What the live still request, `takeSingleCapture()`, actually sets on its
-`TEMPLATE_STILL_CAPTURE` builder is only: the JPEG and (when supported) RAW targets,
-`CONTROL_AF_MODE_CONTINUOUS_PICTURE`, `JPEG_QUALITY = 100`, `CONTROL_ZOOM_RATIO` at 1x and
-`SCALER_CROP_REGION` covering the full active array. Everything else, ISP included, is left at the
-template default.
+**This is a property of already-collected data, not only of old code.** The telephoto ISP bypass,
+the capture-side OIS enable and the AE, flash and 3A-lock copying all lived in
+`applyCommonCaptureSettings()` and `applyOptimalExposureSettings()`, which were reachable only from
+a `takePicture` chain that nothing ever called. The intent was plainly there, since
+`DISABLE_ISP_FOR_TELEPHOTO` was set to `true`, but it was stranded on dead code. **Every image this
+project produced before 2026-09-19 therefore went through full ISP processing, including denoising
+and edge enhancement**, which are exactly the operations that destroy the fine texture an iris
+study measures. Those captures were also taken with OIS on the preview only, and with the still
+request carrying no AE, flash, lock or metering state of its own.
 
-Consequences worth recording:
+The dead chain was deleted on 2026-09-19, and the tuning was restored onto the live path the same
+day after the question was put to the researcher. See limitation 16 for what this means when
+comparing data across that date.
 
-- `DISABLE_ISP_FOR_TELEPHOTO` (still declared `true`) is now an **orphaned constant**: it is
-  referenced nowhere in the source. Its presence in section 24 is a record of a setting that does
-  nothing.
-- `USE_OIS_FOR_TELEPHOTO` (also `true`) is still live, but only where it sets
-  `LENS_OPTICAL_STABILIZATION_MODE_ON` on the **preview** request builder. The still request
-  carries no OIS key of its own.
-- Flash is likewise set only on the preview request, as `FLASH_MODE_TORCH`. Torch is a continuous
-  state rather than a per-frame flash, so the scene is lit while the still is taken, but the still
-  request carries no `FLASH_MODE` or AE key of its own and the app copies none across.
+#### Current behaviour: what `takeSingleCapture()` sets
 
-This is recorded here as a factual correction. Whether the tuning should be restored to the live
-still path is a research decision and is **not** decided by this document; it is tracked as an open
-item in limitation 14.
+The still request is built fresh from `TEMPLATE_STILL_CAPTURE`, targets the JPEG reader and, when
+supported, the RAW reader, and then sets:
+
+| Key | Value | Condition |
+|-----|-------|-----------|
+| `CONTROL_AF_MODE` | `CONTROL_AF_MODE_AUTO` | always (see "AF mode" below) |
+| `JPEG_QUALITY` | 100 | always |
+| `EDGE_MODE` | `EDGE_MODE_OFF` | telephoto, when `DISABLE_ISP_FOR_TELEPHOTO` |
+| `NOISE_REDUCTION_MODE` | `NOISE_REDUCTION_MODE_OFF` | telephoto, as above |
+| `HOT_PIXEL_MODE` | `HOT_PIXEL_MODE_OFF` | telephoto, as above, inside `try/catch` |
+| `SHADING_MODE` | `SHADING_MODE_OFF` | telephoto, as above, inside `try/catch` |
+| `EDGE_MODE` | `EDGE_MODE_HIGH_QUALITY` | every other mode |
+| `NOISE_REDUCTION_MODE` | `NOISE_REDUCTION_MODE_FAST` | every other mode |
+| `LENS_OPTICAL_STABILIZATION_MODE` | `..._ON` | telephoto, and `USE_OIS_FOR_TELEPHOTO`, and `hasOisSupport` |
+| `CONTROL_AE_MODE` | carried from the preview, else `CONTROL_AE_MODE_ON` | always |
+| `FLASH_MODE` | carried from the preview | when the preview has one |
+| `CONTROL_AWB_LOCK`, `CONTROL_AE_LOCK` | carried from the preview | when the preview has them |
+| `CONTROL_AF_REGIONS`, `CONTROL_AE_REGIONS` | carried from the preview | when the preview has them |
+| `CONTROL_ZOOM_RATIO` | 1x (`ZOOM_LEVEL_WIDE`, clamped to the device range) | API 30+ with a zoom ratio range |
+| `SCALER_CROP_REGION` | the full active array | always |
+
+**ISP bypass rationale.** Edge enhancement invents edges that mask real iris patterns, and noise
+reduction smooths away the micro-texture the study depends on, so telephoto turns both off.
+`HOT_PIXEL_MODE` and `SHADING_MODE` are each wrapped in `try/catch` because not every device
+supports setting them.
+
+**Why `FAST` and not `MINIMAL` on the other modes.** `NOISE_REDUCTION_MODE_MINIMAL` previously
+crashed the HAL on a Pixel 10 Pro at 8x zoom. `FAST` is a deliberate choice recorded in the source,
+not an oversight.
+
+**Carrying the preview 3A state.** `CONTROL_AE_MODE` and `FLASH_MODE` are carried across so that
+the torch-lit exposure the participant aligned under is the exposure that actually gets captured,
+and the AWB and AE locks together with the AF and AE metering regions are carried so that the locks
+and metering the capture loop established apply to the frame that is saved rather than to the
+preview alone.
+
+**Zoom and crop region are deliberately NOT carried from the preview.** The old helper copied
+`SCALER_CROP_REGION` and `CONTROL_ZOOM_RATIO` across; the restoration deliberately left that out.
+The still is captured at 1x over the full active array **by design**, and the iris-radius
+derivation below depends on exactly that. Copying the preview zoom onto the still would reintroduce
+the geometry error fixed on the same day (section 11). This is called out explicitly because it
+looks like an omission and is not: do not "fix" it.
+
+**AF mode: `AUTO`, not `CONTINUOUS_PICTURE`.** The still request used to set
+`CONTROL_AF_MODE_CONTINUOUS_PICTURE`, which tells the HAL to resume continuous autofocus
+immediately after the capture loop had driven one-shot AF to `FOCUSED_LOCKED`. That can release the
+lock, so **the focus-lock-and-retry procedure had no guaranteed effect on the saved frame while the
+logs still reported success**: focus was confirmed on the preview and then potentially given away
+on the capture. `CONTROL_AF_MODE_AUTO` preserves the acquired lock. See section 13.
+
+**Still not applied: manual ISO and exposure time.** `SENSOR_SENSITIVITY` and
+`SENSOR_EXPOSURE_TIME` are set nowhere, before or after the restoration, so `TARGET_ISO_MIN`,
+`TARGET_ISO_MAX`, `MIN_SHUTTER_SPEED_NS` and `MAX_SHUTTER_SPEED_NS` remain log-only (section 24).
+Exposure is whatever the carried-over AE state produces.
 
 ### Iris radius derivation
 
@@ -485,6 +529,14 @@ only self-consistent while the ratio is the sole expression of zoom. See section
 builds its own `TEMPLATE_STILL_CAPTURE` request at 1x over the full active array, so the still is
 always full sensor.
 
+**Zoom is deliberately not carried onto the still.** When the capture-side tuning was restored on
+2026-09-19 (section 9), the AE, flash, AWB/AE lock and AF/AE metering state were all carried from
+the preview request onto the still, but `CONTROL_ZOOM_RATIO` and `SCALER_CROP_REGION` were
+deliberately **excluded**, even though the old helper had copied them. Copying the preview zoom
+would magnify the still by the preview factor and reintroduce exactly the geometry error this
+section describes, because `processAndCropCenterBased()` assumes the still is full sensor at 1x.
+Anyone tidying the carry-over list later should leave those two keys out on purpose.
+
 ---
 
 ## 12. Automated Capture Loop
@@ -584,20 +636,42 @@ The metering rectangle is centered on the sensor active array center, applied to
 
 ### Focus Timing Optimization
 
-**Corrected 2026-09-19 against the source.** The table that stood here described an adaptive
-scheme (a shorter alignment delay on subsequent attempts, a skipped focus settle, a 2000 ms focus
-timeout and 2 retries) that **is not in the current code**. The live values are:
+**Focus lock is now preserved onto the still (fixed 2026-09-19).** The focus-lock-and-retry
+procedure below drives one-shot AF to `FOCUSED_LOCKED` before the capture is issued, but the still
+request then set `CONTROL_AF_MODE_CONTINUOUS_PICTURE`, telling the HAL to resume continuous
+autofocus. That can release the lock the loop had just acquired, so the whole procedure had **no
+guaranteed effect on the frame that was actually saved**, while the logs reported a successful lock
+because the lock really had been achieved on the preview. The still request now sets
+`CONTROL_AF_MODE_AUTO`, which preserves it. Focus measurements taken from captures made before
+2026-09-19 should be read with that in mind. See section 9.
 
-| Phase | Value | Constant |
-|-------|-------|----------|
-| Alignment delay | 4000 ms, every attempt, not just the first | literal `delay(4000)` |
+**Restored 2026-09-19.** The February 2026 timing work was lost with the working tree and was
+briefly documented here as absent from the code. It is back. Current values:
+
+| Phase | Value | Source |
+|-------|-------|--------|
+| Alignment delay, first attempt of an eye | 4000 ms | `ALIGNMENT_DELAY_FIRST_MS` |
+| Alignment delay, subsequent attempts | 500 ms | `ALIGNMENT_DELAY_SUBSEQUENT_MS` |
 | Focus settle | 500 ms with manual focus, 1500 ms otherwise | literal `delay(if (useManualFocus) 500 else 1500)` |
-| Focus lock timeout | 3000 ms | `FOCUS_LOCK_TIMEOUT_MS` |
-| Focus retries | 3 | `FOCUS_RETRY_COUNT` |
-| Inter-attempt pause | 2000 ms | literal `delay(2000)` |
+| Focus lock timeout | 2000 ms | `FOCUS_LOCK_TIMEOUT_MS` |
+| Focus retries | 2 | `FOCUS_RETRY_COUNT` |
+| Inter-attempt pause | 500 ms | `INTER_ATTEMPT_DELAY_MS` |
 
-The adaptive scheme appears to have been lost along with the rest of the working tree rather than
-deliberately reverted, but it is not present, so it is not documented as behaviour. See section 22.
+The first-versus-subsequent distinction is carried by an `isFirstAttempt` parameter:
+`performQualityCaptureLoop()` passes `attemptCount == 1` into `performTelephotoCaptureSingle()`,
+which forwards it to `performTelephotoCapture()`. The parameter **defaults to `true`**, so any
+future caller that omits it gets the full 4000 ms delay rather than the short one.
+
+**One part of the old scheme did not come back.** Earlier revisions described the focus settle as
+"skipped on subsequent attempts", on the reasoning that AF runs during the alignment delay. It is
+not skipped: the literal above runs on every attempt, and now that the alignment delay drops to
+500 ms on retries there is much less time for AF to have settled beforehand. Whether the settle is
+still long enough on a retry is worth checking on a device.
+
+**Provenance, if anyone re-tunes these.** The 2000 ms focus timeout is corroborated by the pre-loss
+compiled build. The delay values come from recorded notes rather than from the binary, so they are
+reconstructions of intent rather than recovered fact, and are the weaker of the two if a
+measurement ever disagrees. See section 22.
 
 ---
 
@@ -1208,18 +1282,17 @@ Uses `ContentResolver` with `MediaStore.Images.Media.EXTERNAL_CONTENT_URI`. On A
 
 ### Capture Timing (per attempt)
 
-**Corrected 2026-09-19.** The table that stood here described a February 2026 timing
-optimization (adaptive alignment delay, skipped focus settle, a 2000 ms focus timeout with 2
-retries, a 500 ms inter-attempt delay) that **is not present in the current source**. Those
-reductions appear to have been lost with the working tree rather than reverted on purpose. The
-figures below are what the code does now: fixed delays read from the source, and measured stage
-costs carried over from the earlier revision where the stage itself did not change.
+**Restored 2026-09-19.** The February 2026 timing optimizations were lost with the working tree,
+and this table briefly documented the un-optimized fallback (a flat 4000 ms alignment delay on
+every attempt, a 3000 ms focus timeout with 3 retries, a 2000 ms inter-attempt delay). They are
+back in the code. Fixed delays below are read from the source; stage costs marked "measured" are
+carried over from the February revision, where the stage itself has not changed since.
 
 | Phase | Duration | Source |
 |-------|----------|--------|
-| Alignment delay | 4000ms, on **every** attempt | literal `delay(4000)`, not adaptive |
-| Focus settling | 500ms with manual focus, 1500ms otherwise | literal `delay(if (useManualFocus) 500 else 1500)` |
-| Focus lock | up to 3000ms, 3 retries | `FOCUS_LOCK_TIMEOUT_MS`, `FOCUS_RETRY_COUNT` |
+| Alignment delay | 4000ms first attempt of an eye, 500ms on retries | `ALIGNMENT_DELAY_FIRST_MS`, `ALIGNMENT_DELAY_SUBSEQUENT_MS`, selected by the `isFirstAttempt` parameter |
+| Focus settling | 500ms with manual focus, 1500ms otherwise, on **every** attempt | literal `delay(if (useManualFocus) 500 else 1500)`; the old "skipped on retries" behaviour did **not** come back |
+| Focus lock | up to 2000ms, 2 retries | `FOCUS_LOCK_TIMEOUT_MS`, `FOCUS_RETRY_COUNT` |
 | Flash stabilization | 150ms, plus 50ms post-flash | `FLASH_STABILIZATION_DELAY_MS`, `POST_FLASH_CAPTURE_DELAY_MS` |
 | Capture | ~200ms | Single shot, measured |
 | Eye crop | ~50-100ms | BitmapRegionDecoder (ROI only, not full 12MP), measured |
@@ -1228,12 +1301,14 @@ costs carried over from the earlier revision where the stage itself did not chan
 | Quality assessment | ~20-40ms | Polar grid sampling, measured |
 | JPEG save | ~50ms | MediaStore ContentResolver, measured |
 | RAW save | ~1-3s | Parallel with JPEG via coroutine async, measured |
-| Inter-attempt delay | 2000ms | literal `delay(2000)` |
+| Inter-attempt delay | 500ms | `INTER_ATTEMPT_DELAY_MS` |
 
-**Fixed delays alone come to roughly 7.7 seconds per attempt** (4000 alignment + 1500 focus settle
-+ 150 + 50 flash + 2000 inter-attempt), before any of the measured stage costs or the focus lock
-wait. A 30-attempt eye is therefore a multi-minute exercise. The earlier "~1.5s per attempt"
-estimate described the optimized scheme and no longer applies.
+**Fixed delays now come to roughly 6.2 seconds on the first attempt of an eye and 2.7 seconds on
+each retry** (alignment + focus settle + 150 + 50 flash + inter-attempt; the front camera saves the
+200 ms of flash delay), before the measured stage costs or the focus-lock wait. Under the
+un-optimized fallback every attempt cost about 7.7 seconds of fixed delay, so retries are roughly
+three times cheaper than they were. Confirmed on a device: attempts ran about 5 seconds apart
+rather than about 10 (section 23).
 
 ### Memory Optimizations
 - **BitmapRegionDecoder** for ROI extraction in `EyeImageCropper` (never decodes the full 12MP
@@ -1303,6 +1378,38 @@ values taken straight from the log (`0.15 / 1.25 = 0.12`, and `0.12 * 2448 = 293
 the on-device framing and the comfortable standoff distance need re-confirming in each mode now
 that zoom is expressed once.
 
+### Device validation record: 2026-09-19, Pixel 10 Pro, telephoto mode
+
+A second run on the same device, **after** the double-zoom fix, the ISP restoration and the timing
+restoration, so unlike the front-camera record above it is not distorted by the doubled
+magnification.
+
+| Check | Observed | Meaning |
+|-------|----------|---------|
+| Telephoto detection | Physical telephoto at focal **17.906mm**, roughly 2x optical, preview zoom 1.0 | The universal telephoto detection (section 10) picked the physical lens, as intended on this device family |
+| Zoom expressed once | `ZOOM_DEBUG: path=CONTROL_ZOOM_RATIO ratio=1.0 cropRegion=full active array Rect(0, 0 - 4032, 3024) (no extra crop)` | Confirms the section 11 fix. The previous run logged a **narrowed** crop region, which is the `z * z` behaviour |
+| Iris radius | Derived **0.15** for telephoto, against the old hardcoded 0.06 | Confirms the 2.5x correction predicted in section 9 |
+| ISP bypass | `SINGLE_CAPTURE_ISP: bypass ON (edge/noise/hotpixel/shading off)` | **First time this tuning has reached a real capture** (section 9, limitation 14) |
+| Capture-side OIS | `SINGLE_CAPTURE_OIS: enabled on the still request` | Likewise first reached a real capture |
+| Adaptive timing | 4000 ms alignment on the first attempt, 500 ms on retries; attempts about **5 seconds** apart rather than about 10 | Confirms the restoration in sections 13 and 22 |
+| Usable iris internals | `samples=180 median=183 mad=4.0 sigma=5.9304 band=14.826 occluded=4 (bright=1 dark=3 specular=0) usable=0.9777778` | The rewritten metric (section 17) logs its robust statistics and returns **varying** values rather than the pinned 1.0 of the old darkness count |
+
+**Important caveat on that last row: this run was pointed at a dark, uniform, non-eye surface.**
+The usable-iris metric still returned 0.97 to 1.0 on it. That is not a contradiction of the rewrite
+but the documented blind spot in another form, and it is discussed in limitation 13. The pipeline
+as a whole did reject the frames: the contrast gate failed every one (`Contrast 0.8 FAIL
+[CRITICAL]`) and **zero images were saved**, which is the correct outcome.
+
+**A false positive worth investigating.** On that same non-eye surface the eye-presence detector
+returned `detected=true` at confidence **0.55**, comfortably above its 0.28 composite threshold
+(section 15). The detector exists precisely to reject frames containing no eye, and here it did
+not. Only the contrast metric stood between a dark uniform surface and a saved image. This needs
+looking at before the presence detector is relied on as a gate.
+
+**Scope.** Still one device. The telephoto path is now confirmed for lens selection, zoom
+expression, radius derivation, ISP and OIS application and timing, but **not** for image quality on
+a real iris, since no frame from this run passed the gate.
+
 ---
 
 ## 24. Configuration Constants Reference
@@ -1315,8 +1422,11 @@ that zoom is expressed once.
 | `TARGET_ISO_MAX` | 400 | **Log-only**, as above |
 | `MIN_SHUTTER_SPEED_NS` | 4,000,000 (1/250s) | **Log-only.** `SENSOR_EXPOSURE_TIME` is never set |
 | `MAX_SHUTTER_SPEED_NS` | 8,000,000 (1/125s) | **Log-only**, as above |
-| `FOCUS_LOCK_TIMEOUT_MS` | 3000 | Max time for focus lock (this table previously said 2000) |
-| `FOCUS_RETRY_COUNT` | 3 | AF retries before proceeding (this table previously said 2) |
+| `FOCUS_LOCK_TIMEOUT_MS` | 2000 | Max time for focus lock. Corroborated by the pre-loss compiled build; briefly 3000 while the February optimizations were missing |
+| `FOCUS_RETRY_COUNT` | 2 | AF retries before proceeding. Briefly 3, as above |
+| `ALIGNMENT_DELAY_FIRST_MS` | 4000 | Alignment pause on the first attempt of an eye. Reconstructed from recorded notes, not from the compiled build |
+| `ALIGNMENT_DELAY_SUBSEQUENT_MS` | 500 | Alignment pause on retries, when the participant is already positioned. Reconstructed, as above |
+| `INTER_ATTEMPT_DELAY_MS` | 500 | Pause between attempts. Reconstructed, as above |
 | `AF_METERING_FRACTION` | 12 (1/12 = ~8%) | Standard metering region |
 | `AF_METERING_FRACTION_TELEPHOTO` | 16 (1/16 = ~6%) | Telephoto metering region |
 | `MIN_IRIS_SIZE_FRACTION` | 0.15 | On-screen iris target radius; also the numerator of the iris radius derivation (section 9) |
@@ -1344,8 +1454,8 @@ that zoom is expressed once.
 |----------|-------|-------------|
 | `FLASH_STABILIZATION_DELAY_MS` | 150 | Time after flash before capture |
 | `POST_FLASH_CAPTURE_DELAY_MS` | 50 | Brief delay post-flash |
-| `USE_OIS_FOR_TELEPHOTO` | true | Gates `LENS_OPTICAL_STABILIZATION_MODE_ON` on the **preview** request only. The still request carries no OIS key |
-| `DISABLE_ISP_FOR_TELEPHOTO` | true | **Orphaned constant: referenced nowhere.** The ISP bypass it used to gate lived on the deleted `takePicture` path, so it has never been applied to a saved image (sections 9 and 26) |
+| `USE_OIS_FOR_TELEPHOTO` | true | Gates `LENS_OPTICAL_STABILIZATION_MODE_ON` on the preview request and, since 2026-09-19, on the still request too (telephoto only, and only where `hasOisSupport`) |
+| `DISABLE_ISP_FOR_TELEPHOTO` | true | **Live again since 2026-09-19.** Gates `EDGE_MODE_OFF`, `NOISE_REDUCTION_MODE_OFF`, `HOT_PIXEL_MODE_OFF` and `SHADING_MODE_OFF` on the telephoto still request. It was briefly orphaned while the dead `takePicture` path that used to read it was deleted (section 9) |
 
 ### Eye Presence Detection
 
@@ -1465,9 +1575,13 @@ the same date with the darkness-counting usable-iris metric they belonged to (se
 
 13. **The rewritten usable-iris metric is untuned and degrades above 50 percent occlusion:** The live usable-iris path (section 17) now judges occlusion relative to the iris's own median and robust sigma rather than against an absolute intensity, which makes it independent of iris colour and of overall exposure. Two caveats follow from that design. First, **if more than half of the annulus is occluded the median describes the occluder rather than the iris**, so the metric over-reports usability exactly when the image is worst; heavy occlusion has to be caught by the eye-presence detector and the contrast metric instead. Second, `USABLE_IRIS_SPECULAR_CUTOFF` (250), `USABLE_IRIS_DEVIATION_K` (2.5) and `USABLE_IRIS_MIN_SIGMA` (4.0) are reasoned starting points, not empirically tuned values. Separately, the pass thresholds `USABLE_IRIS_THRESHOLD` (0.50) and `USABLE_IRIS_THRESHOLD_FRONT` (0.35) now mean "fraction unoccluded" rather than "fraction dark", and the front/rear split they encode should be re-examined, because occlusion does not depend on which camera took the picture.
 
-14. **OPEN ITEM, flagged for decision: no capture-side image tuning has ever been applied.** The telephoto ISP bypass (`EDGE_MODE_OFF`, `NOISE_REDUCTION_MODE_OFF`, `SHADING_MODE_OFF`, hot pixel), the capture-side OIS enable, the AE and flash copying, and the manual ISO and exposure-time settings all lived in `applyCommonCaptureSettings()` and `applyOptimalExposureSettings()`, which were reachable only from the `takePicture` chain. That chain was unreachable and was deleted on 2026-09-19. **Consequently every image this application has ever saved was produced with full ISP processing, including denoising and edge enhancement, with OIS set only on the preview, and with the camera's own auto-exposure rather than the intended ISO and shutter targets.** For a study of iris texture this is material: denoising and edge enhancement alter exactly the high-frequency detail such a study measures, and it applies retrospectively to data already collected, not only to future captures. `DISABLE_ISP_FOR_TELEPHOTO` is now an orphaned constant and the ISO and shutter constants are log-only. Whether to restore any of this to the live still path is a research decision that this document does not make; it is recorded here so the decision is made deliberately rather than by default. See sections 9, 11, 22 and 24.
+    **Observed on a device, 2026-09-19.** The telephoto validation run (section 23) was pointed at a dark, uniform, non-eye surface and the metric returned **0.97 to 1.0** on it. This is the blind spot above in another form, and it is worth stating plainly: the metric measures **homogeneity relative to the sampled annulus's own distribution**, so a uniform non-iris surface has no outliers to flag and reads as fully unoccluded. It is not, and cannot be, an eye detector. Rejecting non-eyes is the job of the eye-presence detector and the contrast metric, and in that run the contrast gate did its job, failing every frame (`Contrast 0.8 FAIL [CRITICAL]`) so that zero images were saved. The eye-presence detector, however, did **not**: it returned `detected=true` at confidence 0.55 against its 0.28 threshold on the same surface. That false positive is a separate defect, recorded in section 23, and it means the usable-iris blind spot is currently backstopped by the contrast metric alone.
 
-15. **Timing optimizations described in earlier revisions are not in the code:** The February 2026 capture-timing work (adaptive alignment delay, skipped focus settle on subsequent attempts, a 2000 ms focus timeout with 2 retries, a 500 ms inter-attempt delay) is absent from the current source, which uses a flat 4000 ms alignment delay on every attempt, a 1500 ms focus settle, a 3000 ms timeout with 3 retries and a 2000 ms inter-attempt delay. It appears to have been lost with the working tree rather than deliberately reverted. Fixed delays alone therefore come to roughly 7.7 seconds per attempt. See sections 13 and 22.
+14. **CLOSED 2026-09-19: capture-side image tuning restored.** This was an open item: the telephoto ISP bypass, the capture-side OIS enable and the AE, flash and 3A-lock copying had all been stranded on a dead code path, so no saved image had ever received them. The question was put to the researcher and the decision was to restore. `takeSingleCapture()` now sets the telephoto ISP bypass (`EDGE_MODE_OFF`, `NOISE_REDUCTION_MODE_OFF`, `HOT_PIXEL_MODE_OFF`, `SHADING_MODE_OFF`, the last two guarded), `EDGE_MODE_HIGH_QUALITY` with `NOISE_REDUCTION_MODE_FAST` on the other modes, OIS on telephoto stills where supported, and the carried AE, flash, AWB/AE lock and AF/AE metering state. `DISABLE_ISP_FOR_TELEPHOTO` is live again. Zoom and crop region are deliberately still not carried, because the still must stay at 1x full sensor for the iris-radius derivation. **Two things this does not fix.** Manual ISO and exposure time are still not applied (`SENSOR_SENSITIVITY` and `SENSOR_EXPOSURE_TIME` are set nowhere, so those four constants remain log-only), and nothing can retroactively change how already-collected images were processed: see limitation 16. Sections 9, 11 and 24.
+
+15. **CLOSED 2026-09-19: the February timing optimizations are back.** They had been lost with the working tree, leaving a flat 4000 ms alignment delay on every attempt, a 3000 ms focus timeout with 3 retries and a 2000 ms inter-attempt delay, about 7.7 seconds of fixed delay per attempt. Restored: `ALIGNMENT_DELAY_FIRST_MS` 4000 ms and `ALIGNMENT_DELAY_SUBSEQUENT_MS` 500 ms selected by an `isFirstAttempt` parameter, `INTER_ATTEMPT_DELAY_MS` 500 ms, `FOCUS_LOCK_TIMEOUT_MS` 2000 ms and `FOCUS_RETRY_COUNT` 2. Device-confirmed the same day at about 5 seconds between attempts rather than about 10 (section 23). **Two residual notes.** The focus settle is still not skipped on retries, which the old scheme claimed it was, and it now has a much shorter alignment delay preceding it; and the delay values are reconstructions from recorded notes whereas the 2000 ms focus timeout is corroborated by the pre-loss compiled build, so they are not equally well evidenced if anyone re-tunes them. See sections 13 and 22.
+
+16. **Captures before and after 2026-09-19 are not directly comparable for texture analysis:** Images captured before that date went through **full ISP processing, including denoising and edge enhancement**, because the bypass was stranded on dead code (limitation 14). Images captured after it have the bypass applied on telephoto, and `EDGE_MODE_HIGH_QUALITY` with `NOISE_REDUCTION_MODE_FAST` on the other modes. Denoising and edge enhancement act on exactly the high-frequency detail that iris texture analysis measures, so **the two populations should not be pooled, and any measure sensitive to fine texture (sharpness scores, the motion-blur anisotropy, and any downstream matcher) will shift across that boundary independently of the participant or the capture conditions.** The same boundary also carries the focus-lock fix (section 13), the double-zoom fix and the left-eye zoom mismatch (changelog entries 10, 11 and 16), so 2026-09-19 is a general discontinuity in the data, not only an ISP one. Filenames and EXIF metadata carry a capture timestamp, which is the only way to tell the two apart after the fact.
 
 ---
 
@@ -1482,6 +1596,13 @@ sub-score now varies across its full range instead of sitting in a compressed ba
 usable-iris sub-score, which used to saturate at 100.0 on dark irides, now varies with actual
 occlusion. Quality figures recorded in filenames (`Q{score}`) and in EXIF metadata carry no marker
 of which scale they were produced on, so date the capture session to tell them apart.
+
+**The images themselves also change across this date, not only their scores.** The capture-side ISP
+bypass was restored to the live path (entry 15), so captures from 2026-09-19 onward are no longer
+denoised and edge-enhanced the way every earlier capture was; the still now also keeps the focus
+lock the capture loop acquired (entry 16), the preview zoom is applied once rather than squared
+(entry 10), and telephoto left and right eyes are finally captured at the same zoom (entry 11).
+Treat 2026-09-19 as a discontinuity in the data as well as in the code. See limitation 16.
 
 1. **Gaze Angle removed; six metrics remain, not seven.** `computeGazeAngle()` returned a
    hard-coded `0.15f` whenever eyelid landmarks were absent, and `EyeImageCropper` always passes
@@ -1608,15 +1729,65 @@ of which scale they were produced on, so date the capture session to tell them a
     deletion**, because the deleted code never ran on the live path: `CaptureRequest.JPEG_ORIENTATION`
     is now set nowhere, so stills carry EXIF orientation 0 structurally (section 14); and the
     telephoto ISP bypass, capture-side OIS, AE/flash copying and manual ISO and exposure settings
-    have never been applied to any saved image, leaving `DISABLE_ISP_FOR_TELEPHOTO` orphaned and
-    the ISO and shutter constants log-only. **That last point is flagged for a research decision
-    and is tracked as limitation 14.** See sections 9, 22 and 24.
+    had never been applied to any saved image, leaving `DISABLE_ISP_FOR_TELEPHOTO` momentarily
+    orphaned and the ISO and shutter constants log-only. **That last point was put to the
+    researcher and the tuning was restored the same day; see entry 15.** `DISABLE_ISP_FOR_TELEPHOTO`
+    is live again, and the ISO and shutter constants are still log-only. See sections 9, 22 and 24.
 
 14. **Documentation corrected against the source in four further places.** The eye-switch
     "7-second countdown" does not exist (the gap is a flat 1500 ms with no switch-eyes prompt,
-    section 12); the February 2026 capture-timing optimizations are absent from the code, which
-    still uses a 4000 ms alignment delay on every attempt, a 3000 ms focus timeout and 3 retries,
-    and a 2000 ms inter-attempt delay (sections 13 and 22, limitation 15);
-    `FOCUS_LOCK_TIMEOUT_MS` and `FOCUS_RETRY_COUNT` were listed as 2000 and 2 but are 3000 and 3
-    (section 24); and "full manual control over focus, exposure, ISO and OIS" in section 1
-    overstated what is applied.
+    section 12); the February 2026 capture-timing optimizations were found to be absent from the
+    code, which at that moment used a 4000 ms alignment delay on every attempt, a 3000 ms focus
+    timeout with 3 retries and a 2000 ms inter-attempt delay (**since restored, see entry 17**);
+    the constants table had `FOCUS_LOCK_TIMEOUT_MS` and `FOCUS_RETRY_COUNT` as 2000 and 2 when the
+    code then said 3000 and 3 (the restoration has since put the code back to 2000 and 2, so the
+    original table values were right about the intent and wrong about the code at the time); and
+    "full manual control over focus, exposure, ISO and OIS" in section 1 overstated what is
+    applied.
+
+15. **Capture-side ISP bypass and 3A settings restored to the live path.** Entry 13 recorded that
+    the telephoto ISP bypass, the capture-side OIS enable and the AE, flash and 3A-lock copying had
+    been stranded on the dead `takePicture` chain, so no saved image had ever received them, and
+    limitation 14 held that open pending a research decision. The decision was to restore, and
+    `takeSingleCapture()` now sets, on the still request itself: `EDGE_MODE_OFF`,
+    `NOISE_REDUCTION_MODE_OFF`, `HOT_PIXEL_MODE_OFF` and `SHADING_MODE_OFF` on telephoto (the last
+    two inside `try/catch`, since not every device supports them), gated on
+    `DISABLE_ISP_FOR_TELEPHOTO`, which is live again; `EDGE_MODE_HIGH_QUALITY` and
+    `NOISE_REDUCTION_MODE_FAST` on the other modes, `FAST` being deliberate because
+    `NOISE_REDUCTION_MODE_MINIMAL` previously crashed the HAL on a Pixel 10 Pro at 8x zoom;
+    `LENS_OPTICAL_STABILIZATION_MODE_ON` on telephoto stills where the device supports it, where
+    before it reached the preview only; and `CONTROL_AE_MODE`, `FLASH_MODE`, `CONTROL_AWB_LOCK`,
+    `CONTROL_AE_LOCK`, `CONTROL_AF_REGIONS` and `CONTROL_AE_REGIONS` carried over from the preview,
+    so the torch-lit exposure and the locks and metering the capture loop established apply to the
+    frame that is actually saved. **`CONTROL_ZOOM_RATIO` and `SCALER_CROP_REGION` were deliberately
+    not restored**, although the old helper copied them: the still is captured at 1x full sensor by
+    design and the iris-radius derivation depends on that, so copying the preview zoom would
+    reintroduce the geometry error fixed in entry 10. Manual ISO and exposure time were not
+    restored either and remain unapplied. Limitation 14 is closed; the effect on already-collected
+    data is tracked as limitation 16. See sections 9, 11 and 24.
+
+16. **The still request no longer throws away the focus lock.** It set
+    `CONTROL_AF_MODE_CONTINUOUS_PICTURE`, telling the HAL to resume continuous autofocus
+    immediately after the capture loop had driven one-shot AF to `FOCUSED_LOCKED`. That can release
+    the lock, so **the focus-lock-and-retry procedure had no guaranteed effect on the frame that
+    was saved, while the logs still reported a successful lock** because the lock genuinely had
+    been achieved on the preview. The still request now sets `CONTROL_AF_MODE_AUTO`, which
+    preserves it. Sharpness figures from captures made before 2026-09-19 should be read with this
+    in mind, since a frame could be saved after the lock had been given away. See sections 9
+    and 13.
+
+17. **February timing optimizations restored.** They had been lost with the working tree, leaving a
+    flat `delay(4000)` alignment pause on every attempt, a `delay(2000)` inter-attempt pause, a
+    3000 ms focus timeout and 3 retries: roughly 7.7 seconds of fixed delay per attempt against a
+    30-attempt cap. Restored as named constants: `ALIGNMENT_DELAY_FIRST_MS` (4000 ms) and
+    `ALIGNMENT_DELAY_SUBSEQUENT_MS` (500 ms), selected by an `isFirstAttempt` parameter that
+    `performQualityCaptureLoop()` supplies as `attemptCount == 1` and passes through
+    `performTelephotoCaptureSingle()` into `performTelephotoCapture()`; `INTER_ATTEMPT_DELAY_MS`
+    (500 ms); and `FOCUS_LOCK_TIMEOUT_MS` and `FOCUS_RETRY_COUNT` back to 2000 ms and 2. Fixed
+    delay is now about 6.2 seconds on the first attempt of an eye and about 2.7 seconds per retry,
+    device-confirmed at roughly 5 seconds between attempts rather than 10 (section 23).
+    **Provenance differs between these values and matters if they are re-tuned:** the 2000 ms focus
+    timeout is corroborated by the pre-loss compiled build, whereas the three delay values come
+    from recorded notes and are reconstructions of intent rather than recovered fact. Note also
+    that the old scheme's "focus settle skipped on subsequent attempts" was **not** restored; the
+    settle still runs on every attempt. Limitation 15 is closed. See sections 13 and 22.
