@@ -14,16 +14,21 @@ import kotlin.math.sqrt
 
 /**
  * ISO 29794-6 inspired iris quality assessment.
- * Computes 7 quality metrics on a cropped eye image and produces
+ * Computes 6 quality metrics on a cropped eye image and produces
  * a composite score with pass/fail determination.
+ *
+ * 2026-09-19: the GAZE_ANGLE metric was removed (it could not be computed
+ * without eyelid landmarks, so it returned a constant). The remaining six
+ * weights were renormalised to keep the composite on its 0..100 scale.
+ * See the note above "Metric 2: Pupil-to-Iris Ratio" for details.
  */
 object IrisQualityAssessor {
     private const val TAG = "IrisQualityAssessor"
 
     // Quality metric definitions
+    // NOTE: GAZE_ANGLE was removed on 2026-09-19, see the class doc above.
     enum class MetricId {
         USABLE_IRIS_AREA,
-        GAZE_ANGLE,
         PUPIL_IRIS_RATIO,
         IRIS_PUPIL_CONTRAST,
         ILLUMINATION_UNIFORMITY,
@@ -50,13 +55,29 @@ object IrisQualityAssessor {
     // Thresholds
     private const val USABLE_IRIS_THRESHOLD = 0.50f
     private const val USABLE_IRIS_THRESHOLD_FRONT = 0.35f  // Lower threshold for front camera (no flash)
-    private const val GAZE_DISPLACEMENT_THRESHOLD = 0.25f
     private const val PUPIL_RATIO_MIN = 0.2f
     private const val PUPIL_RATIO_MAX = 0.7f
     private const val CONTRAST_THRESHOLD = 0.4f
     private const val UNIFORMITY_THRESHOLD = 0.50f
-    private const val MOTION_BLUR_THRESHOLD = 4.0f
     private const val COMPOSITE_PASS_THRESHOLD = 40f
+
+    // Motion blur anisotropy threshold (see computeMotionBlur).
+    // The corrected metric ranges from 1.0 (perfectly isotropic gradient
+    // orientations = no directional blur) to MOTION_BLUR_NUM_BINS = 36.0
+    // (all gradient energy in a single 5 degree orientation bin).
+    // 6.0 means the dominant orientation bin carries 6x the mean bin energy,
+    // i.e. roughly 17% of all gradient energy inside one 5 degree band, which
+    // is a strong directional signature.
+    // WARNING: this value is a reasoned starting point, NOT an empirical one.
+    // The previous threshold (4.0f) was never meaningful because the old
+    // anisotropy formula was mathematically pinned at ~1.0 for every image,
+    // so there is no historical data to calibrate against. It must be
+    // re-tuned against a real capture set before the metric is trusted.
+    private const val MOTION_BLUR_THRESHOLD = 6.0f
+    // Number of gradient orientation bins; also the metric's upper bound.
+    private const val MOTION_BLUR_NUM_BINS = 36
+    // Lowest possible anisotropy: a perfectly isotropic gradient histogram.
+    private const val MOTION_BLUR_ISOTROPIC = 1.0f
 
     // Intensity thresholds for usable iris detection (intensity-based fallback)
     private const val IRIS_INTENSITY_THRESHOLD_REAR = 180    // Dark iris expected with flash
@@ -66,7 +87,7 @@ object IrisQualityAssessor {
      * Perform full iris quality assessment on a cropped eye image.
      *
      * @param cropResult The cropped eye image from EyeImageCropper
-     * @param existingSharpnessScore Sharpness score from SharpnessAnalyzer (used for metric 7)
+     * @param existingSharpnessScore Sharpness score from SharpnessAnalyzer (used for metric 6)
      * @param sharpnessThreshold Mode-specific sharpness threshold for normalization
      * @param contrastThreshold Mode-specific contrast threshold
      * @param isFrontCamera True if using front camera (adjusts intensity thresholds for no-flash capture)
@@ -100,27 +121,27 @@ object IrisQualityAssessor {
             rawValue = usableArea,
             normalizedScore = usableScore,
             passed = usableArea >= usableIrisThreshold,
-            weight = 0.20f,
+            weight = 0.2222f,   // renormalised 0.20 / 0.90
             isCritical = true
         ))
 
-        // 2. Gaze Angle
-        val gazeDisplacement = computeGazeAngle(
-            bitmap, irisCenter, irisRadius,
-            cropResult.upperEyelidPoints, cropResult.lowerEyelidPoints
-        )
-        val gazeScore = ((1f - gazeDisplacement / 0.5f) * 100f).coerceIn(0f, 100f)
-        metrics.add(MetricResult(
-            id = MetricId.GAZE_ANGLE,
-            name = "Gaze Angle",
-            rawValue = gazeDisplacement,
-            normalizedScore = gazeScore,
-            passed = gazeDisplacement <= GAZE_DISPLACEMENT_THRESHOLD,
-            weight = 0.10f,
-            isCritical = true
-        ))
+        // ---------------------------------------------------------------
+        // REMOVED 2026-09-19: metric 2 was "Gaze Angle" (weight 0.10,
+        // critical). It could not be computed without eyelid landmarks, and
+        // EyeImageCropper always passes upperEyelidPoints = lowerEyelidPoints
+        // = null since MediaPipe was removed, so computeGazeAngle returned a
+        // hard-coded 0.15f on every image. That produced a constant score of
+        // 70.0, a critical gate that could never fail, and a fixed +7.0
+        // contribution to every composite score.
+        // The six surviving weights were renormalised by dividing each by
+        // 0.90 (the sum left after removing gaze), so they still add up to
+        // 1.0 and COMPOSITE_PASS_THRESHOLD stays on the same 0..100 scale:
+        //   0.20 -> 0.2222, 0.10 -> 0.1111, 0.15 -> 0.1667
+        // If eyelid landmarks ever become available again, re-add the metric
+        // here and renormalise the weights once more.
+        // ---------------------------------------------------------------
 
-        // 3. Pupil-to-Iris Ratio
+        // 2. Pupil-to-Iris Ratio
         val pupilRatio = computePupilIrisRatio(bitmap, irisCenter, irisRadius)
         val ratioScore = if (pupilRatio in PUPIL_RATIO_MIN..PUPIL_RATIO_MAX) {
             // Best at 0.45 (center of range)
@@ -138,11 +159,11 @@ object IrisQualityAssessor {
             rawValue = pupilRatio,
             normalizedScore = ratioScore,
             passed = pupilRatio in PUPIL_RATIO_MIN..PUPIL_RATIO_MAX,
-            weight = 0.10f,
+            weight = 0.1111f,   // renormalised 0.10 / 0.90
             isCritical = false
         ))
 
-        // 4. Iris-Pupil Contrast
+        // 3. Iris-Pupil Contrast
         val contrast = computeIrisPupilContrast(bitmap, irisCenter, irisRadius, pupilRatio)
         val contrastScore = (contrast / 1.0f * 100f).coerceIn(0f, 100f)
         metrics.add(MetricResult(
@@ -151,11 +172,11 @@ object IrisQualityAssessor {
             rawValue = contrast,
             normalizedScore = contrastScore,
             passed = contrast >= contrastThreshold,
-            weight = 0.15f,
+            weight = 0.1667f,   // renormalised 0.15 / 0.90
             isCritical = true
         ))
 
-        // 5. Illumination Uniformity
+        // 4. Illumination Uniformity
         val uniformity = computeIlluminationUniformity(bitmap, irisCenter, irisRadius, pupilRatio)
         val uniformityScore = (uniformity * 100f).coerceIn(0f, 100f)
         metrics.add(MetricResult(
@@ -164,24 +185,35 @@ object IrisQualityAssessor {
             rawValue = uniformity,
             normalizedScore = uniformityScore,
             passed = uniformity >= UNIFORMITY_THRESHOLD,
-            weight = 0.10f,
+            weight = 0.1111f,   // renormalised 0.10 / 0.90
             isCritical = false
         ))
 
-        // 6. Motion Blur
+        // 5. Motion Blur
+        // directionality is the gradient-orientation anisotropy in
+        // [1.0 (isotropic, no blur) .. 36.0 (all energy in one orientation)].
+        // Score mapping is anchored at the isotropic floor rather than at 0,
+        // because 0 is not reachable by the metric:
+        //   excess     = directionality - 1.0            (0 at perfect isotropy)
+        //   headroom   = MOTION_BLUR_THRESHOLD - 1.0     (excess at the threshold)
+        //   score      = (1 - excess / (2 * headroom)) * 100, clamped to 0..100
+        // So the score is 100 at 1.0, 50 exactly at the threshold, 0 at
+        // (2 * threshold - 1), and monotonically decreasing in between.
         val directionality = computeMotionBlur(bitmap, irisCenter, irisRadius)
-        val blurScore = ((MOTION_BLUR_THRESHOLD * 2f - directionality) / (MOTION_BLUR_THRESHOLD * 2f) * 100f).coerceIn(0f, 100f)
+        val blurHeadroom = MOTION_BLUR_THRESHOLD - MOTION_BLUR_ISOTROPIC
+        val blurExcess = directionality - MOTION_BLUR_ISOTROPIC
+        val blurScore = ((1f - blurExcess / (2f * blurHeadroom)) * 100f).coerceIn(0f, 100f)
         metrics.add(MetricResult(
             id = MetricId.MOTION_BLUR,
             name = "Motion Blur",
             rawValue = directionality,
             normalizedScore = blurScore,
             passed = directionality <= MOTION_BLUR_THRESHOLD,
-            weight = 0.15f,
+            weight = 0.1667f,   // renormalised 0.15 / 0.90
             isCritical = false
         ))
 
-        // 7. Sharpness (reuse existing SharpnessAnalyzer score)
+        // 6. Sharpness (reuse existing SharpnessAnalyzer score)
         val normalizedSharpness = if (sharpnessThreshold > 0) {
             ((existingSharpnessScore / sharpnessThreshold) * 50f).coerceIn(0.0, 100.0).toFloat()
         } else {
@@ -193,7 +225,7 @@ object IrisQualityAssessor {
             rawValue = existingSharpnessScore.toFloat(),
             normalizedScore = normalizedSharpness,
             passed = existingSharpnessScore >= sharpnessThreshold,
-            weight = 0.20f,
+            weight = 0.2222f,   // renormalised 0.20 / 0.90
             isCritical = true
         ))
 
@@ -374,46 +406,13 @@ object IrisQualityAssessor {
     }
 
     // ========================================================================
-    // Metric 2: Gaze Angle
-    // ========================================================================
-
-    /**
-     * Compute gaze displacement: iris center relative to eye corners midpoint.
-     * Returns normalized displacement (0 = centered, 1 = at edge).
-     */
-    @Suppress("UNUSED_PARAMETER")
-    private fun computeGazeAngle(
-        bitmap: Bitmap,
-        irisCenter: PointF,
-        irisRadius: Float,
-        upperEyelidPoints: List<PointF>?,
-        lowerEyelidPoints: List<PointF>?
-    ): Float {
-        if (upperEyelidPoints == null || lowerEyelidPoints == null ||
-            upperEyelidPoints.isEmpty() || lowerEyelidPoints.isEmpty()) {
-            // No landmarks: assume on-axis with moderate score
-            return 0.15f  // score ~70
-        }
-
-        // Use the widest points as inner/outer corners
-        val allPoints = upperEyelidPoints + lowerEyelidPoints
-        val leftMost = allPoints.minByOrNull { it.x } ?: return 0.15f
-        val rightMost = allPoints.maxByOrNull { it.x } ?: return 0.15f
-
-        val midX = (leftMost.x + rightMost.x) / 2f
-        val midY = (leftMost.y + rightMost.y) / 2f
-        val eyeWidth = rightMost.x - leftMost.x
-
-        if (eyeWidth < 1f) return 0.15f
-
-        val dx = abs(irisCenter.x - midX) / eyeWidth
-        val dy = abs(irisCenter.y - midY) / eyeWidth
-
-        return sqrt(dx * dx + dy * dy)
-    }
-
-    // ========================================================================
-    // Metric 3: Pupil-to-Iris Ratio
+    // Metric 2: Pupil-to-Iris Ratio
+    //
+    // (The former "Metric 2: Gaze Angle" section lived here. computeGazeAngle
+    // and GAZE_DISPLACEMENT_THRESHOLD were deleted on 2026-09-19 along with
+    // the metric itself, because gaze displacement cannot be measured without
+    // eyelid landmarks and the function returned a hard-coded 0.15f. The
+    // remaining six weights were renormalised; see the note in assess().)
     // ========================================================================
 
     /**
@@ -477,7 +476,7 @@ object IrisQualityAssessor {
     }
 
     // ========================================================================
-    // Metric 4: Iris-Pupil Contrast
+    // Metric 3: Iris-Pupil Contrast
     // ========================================================================
 
     /**
@@ -547,7 +546,7 @@ object IrisQualityAssessor {
     }
 
     // ========================================================================
-    // Metric 5: Illumination Uniformity
+    // Metric 4: Illumination Uniformity
     // ========================================================================
 
     /**
@@ -620,13 +619,31 @@ object IrisQualityAssessor {
     }
 
     // ========================================================================
-    // Metric 6: Motion Blur
+    // Metric 5: Motion Blur
     // ========================================================================
 
     /**
-     * Gradient direction histogram (36 bins) weighted by magnitude.
-     * Anisotropy = peak/mean. Low anisotropy = sharp (uniform gradient directions).
-     * High anisotropy = motion blur (dominant direction).
+     * Gradient orientation histogram (MOTION_BLUR_NUM_BINS bins over [0, pi))
+     * weighted by gradient magnitude.
+     *
+     * Anisotropy = peak bin / mean over the FULL histogram, so the result is
+     * 1.0 for a perfectly isotropic histogram (every bin equal) and rises to
+     * MOTION_BLUR_NUM_BINS (36.0) when all gradient energy falls into one bin.
+     * Low anisotropy = sharp (gradients point every which way).
+     * High anisotropy = motion blur (one dominant edge orientation).
+     *
+     * Two bugs fixed on 2026-09-19:
+     *  1. The mean was previously taken over the NON-ZERO bins only, which
+     *     cancels exactly the concentration this metric exists to detect:
+     *     an isotropic histogram (all bins v) gave v/v = 1.0 and a fully
+     *     directional one (one bin V, the rest zero) also gave V/V = 1.0,
+     *     so the metric passed unconditionally. The mean is now taken over
+     *     the full histogram.
+     *  2. Binning used atan2 over the full 2*pi range, but gradient
+     *     ORIENTATION is mod pi, not mod 2*pi, so a single straight edge
+     *     populated two opposite bins and halved the measured peak. The
+     *     angle is now folded into [0, pi) before binning. The bin count is
+     *     unchanged (36), so each bin is now 5 degrees wide instead of 10.
      */
     private fun computeMotionBlur(
         bitmap: Bitmap,
@@ -644,7 +661,8 @@ object IrisQualityAssessor {
 
         val roiW = roiRight - roiLeft
         val roiH = roiBottom - roiTop
-        if (roiW < 5 || roiH < 5) return 2.0f  // Too small, assume OK
+        // Too small to measure, assume the best case (perfectly isotropic).
+        if (roiW < 5 || roiH < 5) return MOTION_BLUR_ISOTROPIC
 
         // Get pixels and convert to grayscale
         val pixels = IntArray(roiW * roiH)
@@ -658,9 +676,10 @@ object IrisQualityAssessor {
                     (p and 0xFF) * 0.114).toInt()
         }
 
-        // Compute gradient histogram (36 bins = 10 degree intervals)
-        val numBins = 36
+        // Gradient orientation histogram: 36 bins over [0, pi) = 5 degree intervals
+        val numBins = MOTION_BLUR_NUM_BINS
         val histogram = FloatArray(numBins)
+        val pi = Math.PI.toFloat()
 
         for (y in 1 until roiH - 1) {
             for (x in 1 until roiW - 1) {
@@ -677,21 +696,25 @@ object IrisQualityAssessor {
                 val magnitude = sqrt((gx * gx + gy * gy).toFloat())
                 if (magnitude < 5f) continue  // Skip near-zero gradients
 
-                val angle = atan2(gy.toFloat(), gx.toFloat())
-                val normalizedAngle = ((angle + Math.PI.toFloat()) / (2f * Math.PI.toFloat()) * numBins)
-                    .toInt().coerceIn(0, numBins - 1)
+                // Gradient orientation is mod pi: fold atan2's (-pi, pi] range
+                // into [0, pi) so opposite gradient directions share a bin.
+                var angle = atan2(gy.toFloat(), gx.toFloat())
+                if (angle < 0f) angle += pi
+                if (angle >= pi) angle -= pi
 
-                histogram[normalizedAngle] += magnitude
+                val bin = ((angle / pi) * numBins).toInt().coerceIn(0, numBins - 1)
+                histogram[bin] += magnitude
             }
         }
 
-        // Compute anisotropy = peak / mean
-        val nonZeroBins = histogram.filter { it > 0 }
-        if (nonZeroBins.isEmpty()) return 1.0f  // No gradients = likely uniform = ok
+        // Anisotropy = peak bin / mean over the FULL histogram.
+        // Range: 1.0 (all bins equal, isotropic) .. numBins (one bin holds
+        // everything, perfectly directional).
+        val meanValue = histogram.average().toFloat()
+        if (meanValue <= 0f) return MOTION_BLUR_ISOTROPIC  // No gradients = uniform = ok
 
         val peakValue = histogram.maxOrNull() ?: 0f
-        val meanValue = nonZeroBins.average().toFloat()
 
-        return if (meanValue > 0f) (peakValue / meanValue) else 1.0f
+        return (peakValue / meanValue).coerceIn(MOTION_BLUR_ISOTROPIC, numBins.toFloat())
     }
 }

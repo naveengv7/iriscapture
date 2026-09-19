@@ -145,12 +145,6 @@ class CameraFragment : Fragment() {
 
         // === TELEPHOTO IRIS CAPTURE OPTIMIZATIONS ===
 
-        // Focus Bracketing: Capture at multiple focus distances to ensure sharp iris
-        // Telephoto DOF is ~2mm at close range, so we bracket ±0.5 diopters
-        private const val FOCUS_BRACKET_ENABLED = true
-        private const val FOCUS_BRACKET_STEPS = 5             // Number of focus distances to capture
-        private const val FOCUS_BRACKET_STEP_DIOPTERS = 0.3f  // Step size in diopters (~3cm at close range)
-
         // Flash timing optimization: Reduce delay to minimize pupil constriction
         // Pupil constricts within 200-300ms of bright light exposure
         private const val FLASH_STABILIZATION_DELAY_MS = 150L  // Was 1000ms, now 150ms for larger pupil
@@ -271,12 +265,6 @@ class CameraFragment : Fragment() {
     @Volatile private var captureIrisNormY: Float = 0.5f
     @Volatile private var captureIrisNormRadius: Float = 0.05f
 
-    // Zoom-adjusted iris coordinates (mapped from preview zoom to 1x capture space)
-    // Pre-computed when burst starts, used by both sharpness analysis and eye cropping
-    @Volatile private var adjustedIrisNormX: Float = 0.5f
-    @Volatile private var adjustedIrisNormY: Float = 0.5f
-    @Volatile private var adjustedIrisNormRadius: Float = 0.05f
-
     // RAW Buffer Matching
     private val rawResultQueue = TreeMap<Long, TotalCaptureResult>()
     private val rawImageQueue = TreeMap<Long, Image>()
@@ -295,16 +283,8 @@ class CameraFragment : Fragment() {
     @Volatile private var rightEyeAttemptCount = 0  // Total capture attempts for right eye
     @Volatile private var leftEyeAttemptCount = 0   // Total capture attempts for left eye
 
-    // Burst Capture with Best-Frame Selection (legacy - kept for reference)
-    private val BURST_FRAME_COUNT = 3   // Number of frames to capture (reduced for HAL stability)
-    private val SAVE_TOP_FRAMES = 3     // Number of top sharpest frames to save (must be <= BURST_FRAME_COUNT)
-    private var isBurstCaptureActive = false
-    private var burstFrameBuffer = mutableListOf<SharpnessAnalyzer.ScoredImage>()
-    private var expectedBurstFrames = 0
-    private var burstBaseFilename = ""
-    @Volatile private var burstCaptureCallback: ((List<SharpnessAnalyzer.ScoredImage>) -> Unit)? = null
-
-    // Which eye is being captured (for cropping during burst)
+    // Which eye is being captured. Set by performEyeCapture; its only reader was the
+    // burst capture path, removed 2026-09-19 as unreachable. Kept as capture state.
     @Volatile private var captureIsRightEye: Boolean = true
 
     // Flag to prevent old ImageReader listener from saving during single capture mode
@@ -460,6 +440,10 @@ class CameraFragment : Fragment() {
             switchCameraInternal()
         }
 
+        // NOTE (2026-09-19): this "B" button is hidden (setupModeUI sets it to View.GONE) and
+        // isBurstMode is never read by the capture pipeline, so it only toggles its own
+        // highlight. The burst / focus-bracket capture path it used to imply was removed as
+        // dead code; the live path is takeSingleCapture + processAndCropCenterBased.
         fragmentCameraBinding.btnBurst.setOnClickListener {
             isBurstMode = !isBurstMode
             if (isBurstMode) {
@@ -978,7 +962,7 @@ class CameraFragment : Fragment() {
                             backgroundExecutor.execute {
                                 val image = reader.acquireNextImage() ?: return@execute
                                 val timestamp = image.timestamp
-                                Log.d(TAG, "IMAGE_RECEIVED: timestamp=$timestamp burstActive=$isBurstCaptureActive mapKeys=${filenameMap.keys.take(5)}")
+                                Log.d(TAG, "IMAGE_RECEIVED: timestamp=$timestamp mapKeys=${filenameMap.keys.take(5)}")
                                 val buffer = image.planes[0].buffer
                                 val bytes = ByteArray(buffer.remaining())
                                 buffer.get(bytes)
@@ -987,10 +971,7 @@ class CameraFragment : Fragment() {
                                 val filename = filenameMap.remove(timestamp)
                                 Log.d(TAG, "IMAGE_RECEIVED: filename=$filename bytes=${bytes.size}")
 
-                                // Check if this is part of a burst capture
-                                if (isBurstCaptureActive && filename != null && filename.startsWith(burstBaseFilename)) {
-                                    handleBurstFrame(bytes, timestamp, filename)
-                                } else if (isSingleCaptureActive) {
+                                if (isSingleCaptureActive) {
                                     // Skip saving - single capture mode handles its own saving
                                     Log.d(TAG, "IMAGE_RECEIVED: Skipping save (single capture mode active)")
                                 } else if (filename != null) {
@@ -2196,179 +2177,6 @@ class CameraFragment : Fragment() {
     }
 
     /**
-     * Handle a frame received during burst capture.
-     * Calculates sharpness focused on the iris region and buffers the image.
-     * When all expected frames are received, selects top sharpest, crops eye,
-     * runs ISO 29794-6 quality assessment, and saves only passing images.
-     */
-    private fun handleBurstFrame(bytes: ByteArray, timestamp: Long, filename: String) {
-        // Calculate sharpness score focused on the iris region.
-        // Use ADJUSTED coordinates (mapped from preview zoom to 1x capture space)
-        // since the JPEG is captured at 1x zoom, not the preview zoom.
-        val sharpnessScore = SharpnessAnalyzer.calculateSharpnessForIris(
-            jpegBytes = bytes,
-            irisNormX = adjustedIrisNormX,
-            irisNormY = adjustedIrisNormY,
-            irisNormRadius = adjustedIrisNormRadius,
-            expandFactor = 1.5f  // Include slight margin around iris
-        )
-        Log.d(TAG, "BURST_CAPTURE: Frame received, irisSharpness=$sharpnessScore, " +
-                "adjustedIrisROI=(${(adjustedIrisNormX*100).toInt()}%, ${(adjustedIrisNormY*100).toInt()}%, r=${(adjustedIrisNormRadius*100).toInt()}%), " +
-                "filename=$filename")
-
-        synchronized(burstFrameBuffer) {
-            burstFrameBuffer.add(
-                SharpnessAnalyzer.ScoredImage(
-                    jpegBytes = bytes,
-                    sharpnessScore = sharpnessScore,
-                    timestamp = timestamp,
-                    filename = filename
-                )
-            )
-
-            Log.d(TAG, "BURST_CAPTURE: Buffered ${burstFrameBuffer.size}/$expectedBurstFrames frames")
-
-            // Check if we have all expected frames
-            if (burstFrameBuffer.size >= expectedBurstFrames) {
-                // Sort by sharpness (highest first) and take top N
-                val sortedFrames = burstFrameBuffer.sortedByDescending { it.sharpnessScore }
-                val topFrames = sortedFrames.take(SAVE_TOP_FRAMES)
-
-                // Filter frames that pass the sharpness quality threshold
-                val qualityFrames = topFrames.filter { it.sharpnessScore >= sharpnessThreshold }
-                val rejectedFrames = topFrames.filter { it.sharpnessScore < sharpnessThreshold }
-
-                // Log all frame scores for debugging
-                sortedFrames.forEachIndexed { idx, frame ->
-                    val passedThreshold = frame.sharpnessScore >= sharpnessThreshold
-                    val marker = when {
-                        idx >= SAVE_TOP_FRAMES -> "DISCARDED"
-                        passedThreshold -> "QUALITY_PASS"
-                        else -> "QUALITY_FAIL"
-                    }
-                    Log.d(TAG, "BURST_CAPTURE: Rank ${idx + 1}: sharpness=${String.format("%.1f", frame.sharpnessScore)} " +
-                            "(threshold=$sharpnessThreshold) [$marker]")
-                }
-
-                // Use pre-computed zoom-adjusted iris coordinates (computed in performEyeCapture).
-                // These map from preview zoom space to 1x capture space, ensuring both
-                // sharpness analysis and eye cropping use consistent, correct coordinates.
-                Log.d(TAG, "BURST_CROP: mode=$captureMode " +
-                        "stored=(${captureIrisNormX}, ${captureIrisNormY}, r=${captureIrisNormRadius}) " +
-                        "adjusted=($adjustedIrisNormX, $adjustedIrisNormY, r=$adjustedIrisNormRadius)")
-
-                val isRightEye = captureIsRightEye
-
-                // Process frames: crop eye + ISO quality assess + save if passed
-                var savedCount = 0
-                var latestQualityResult: IrisQualityAssessor.IrisQualityResult? = null
-
-                qualityFrames.forEachIndexed { idx, frame ->
-                    val rank = idx + 1
-                    val rankedFilename = frame.filename.replace("_BURST", "_HQ${rank}")
-
-                    // Crop eye region using pre-computed zoom-adjusted coordinates
-                    var cropResult: EyeImageCropper.EyeCropResult? = null
-                    try {
-                        cropResult = EyeImageCropper.cropFromStoredCoordinates(
-                            jpegBytes = frame.jpegBytes,
-                            irisNormX = adjustedIrisNormX,
-                            irisNormY = adjustedIrisNormY,
-                            irisNormRadius = adjustedIrisNormRadius,
-                            expandFactor = 4.0f,  // 4x the actual iris radius = good eye crop
-                            isFrontCamera = isFrontCamera
-                        )
-                    } catch (e: Exception) {
-                        Log.e(TAG, "BURST_CAPTURE: Eye crop failed for HQ$rank", e)
-                    }
-
-                    if (cropResult != null) {
-                        // Run ISO 29794-6 quality assessment
-                        val qualityResult = try {
-                            IrisQualityAssessor.assess(
-                                cropResult = cropResult,
-                                existingSharpnessScore = frame.sharpnessScore,
-                                sharpnessThreshold = sharpnessThreshold,
-                                contrastThreshold = if (captureMode == MODE_FRONT) 0.10f else 0.4f,
-                                isFrontCamera = isFrontCamera
-                            )
-                        } catch (e: Exception) {
-                            Log.e(TAG, "BURST_CAPTURE: Quality assessment failed for HQ$rank", e)
-                            null
-                        }
-
-                        latestQualityResult = qualityResult
-
-                        if (qualityResult != null && qualityResult.overallPassed) {
-                            // Save full image
-                            saveImage(frame.jpegBytes, rankedFilename)
-                            // Save cropped eye image
-                            val qualityScore = qualityResult.overallScore.toInt()
-                            val cropFilename = "${rankedFilename}_CROP_Q${qualityScore}"
-                            saveCroppedImage(cropResult.croppedBitmap, cropFilename)
-                            savedCount++
-                            Log.d(TAG, "BURST_CAPTURE: Saved HQ$rank + CROP " +
-                                    "sharpness=${String.format("%.1f", frame.sharpnessScore)} " +
-                                    "isoQuality=${qualityScore} [PASSED]")
-                        } else {
-                            val reason = if (qualityResult == null) "assessment_error"
-                                else qualityResult.metrics.filter { !it.passed }
-                                    .joinToString(",") { "${it.name}=${String.format("%.0f", it.normalizedScore)}" }
-                            Log.d(TAG, "ISO_QUALITY: Discarded HQ$rank - $reason")
-                        }
-
-                        // Recycle cropped bitmap
-                        try {
-                            if (!cropResult.croppedBitmap.isRecycled) {
-                                cropResult.croppedBitmap.recycle()
-                            }
-                        } catch (_: Exception) { }
-                    } else {
-                        // Crop failed - save full image anyway (fallback)
-                        saveImage(frame.jpegBytes, rankedFilename)
-                        savedCount++
-                        Log.d(TAG, "BURST_CAPTURE: Saved HQ$rank (no crop) sharpness=${String.format("%.1f", frame.sharpnessScore)}")
-                    }
-                }
-
-                // Log rejected frames (below sharpness threshold)
-                rejectedFrames.forEach { frame ->
-                    Log.d(TAG, "BURST_CAPTURE: Rejected frame with sharpness=${String.format("%.1f", frame.sharpnessScore)} " +
-                            "[BELOW THRESHOLD $sharpnessThreshold]")
-                }
-
-                Log.d(TAG, "BURST_CAPTURE: Quality check: $savedCount/$SAVE_TOP_FRAMES passed (sharpness=$sharpnessThreshold + ISO quality)")
-
-                // Relay quality result to overlay for display
-                lastQualityResult = latestQualityResult
-                if (latestQualityResult != null) {
-                    activity?.runOnUiThread {
-                        if (_fragmentCameraBinding != null) {
-                            fragmentCameraBinding.overlay.qualityResult = latestQualityResult
-                            fragmentCameraBinding.overlay.showQualityOverlay = true
-                            fragmentCameraBinding.overlay.invalidate()
-
-                            // Auto-hide quality panel after 5 seconds
-                            fragmentCameraBinding.overlay.postDelayed({
-                                fragmentCameraBinding.overlay.showQualityOverlay = false
-                                fragmentCameraBinding.overlay.invalidate()
-                            }, 5000)
-                        }
-                    }
-                }
-
-                // Notify callback with only quality frames (empty if none passed)
-                burstCaptureCallback?.invoke(qualityFrames)
-
-                // Clear buffer and reset state
-                burstFrameBuffer.clear()
-                isBurstCaptureActive = false
-                burstCaptureCallback = null
-            }
-        }
-    }
-
-    /**
      * Result of processing and cropping a captured image.
      */
     data class ProcessedCropResult(
@@ -2546,15 +2354,41 @@ class CameraFragment : Fragment() {
         val irisNormX = 0.5f
         val irisNormY = 0.5f
 
-        // Calculate iris radius based on capture mode:
-        // - MAIN_8X: Preview at 8x digital, capture at 1x - iris is 8x smaller in capture
-        // - TELEPHOTO: 5x optical zoom at ~30-40cm distance - iris fills ~12-16% of frame
-        // - FRONT: Tighter crop - user is close to camera, iris fills more of frame
-        val irisNormRadius = when (captureMode) {
-            MODE_TELEPHOTO -> 0.06f  // Telephoto at 30-40cm: iris ~12% diameter, tighter crop
-            MODE_MAIN_8X -> 0.15f / ZOOM_MAIN_8X  // 8x preview to 1x capture
-            MODE_FRONT -> 0.05f  // Front camera: very tight crop around iris
-            else -> 0.15f
+        // Iris radius in the CAPTURED STILL, normalised to the still's width.
+        //
+        // Derivation (corrected 2026-09-19; this used to be a per-mode hardcoded guess):
+        // The user aligns their iris to the on-screen target that OverlayView draws at
+        // radius MIN_IRIS_SIZE_FRACTION (0.15) of the display frame width, and they see
+        // that target through the PREVIEW, which runs at whatever zoom the mode selected.
+        // takeSingleCapture, however, forces the still to 1x / full active array, so every
+        // feature shrinks by the preview zoom factor Z when it lands in the still:
+        //     irisNormRadius = MIN_IRIS_SIZE_FRACTION / previewZoom
+        // Read the zoom ACTUALLY applied to the preview request instead of a per-mode
+        // literal, so this stays correct when the zoom-selection logic changes or a device
+        // takes the telephoto fallback path (telephotoZoomLevel = maxZoom there).
+        // Worked values: physical telephoto lens (previewZoom 1.0) -> 0.15;
+        // zoom-based telephoto (3.0) -> 0.05; MAIN_8X (ZOOM_MAIN_8X = 4.0) -> 0.0375;
+        // front (FRONT_DEFAULT_ZOOM = 1.25) -> 0.12.
+        // Please do not replace this with per-mode literals again.
+        val previewZoom = run {
+            // CONTROL_ZOOM_RATIO only exists from API 30; older devices zoom via
+            // SCALER_CROP_REGION alone and report null here.
+            val applied = if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.R) {
+                previewRequestBuilder?.get(CaptureRequest.CONTROL_ZOOM_RATIO)
+            } else null
+            // Fallback: the zoom this mode asks setZoom() for (see startAutomatedCapture).
+            applied ?: when (captureMode) {
+                MODE_TELEPHOTO -> telephotoZoomLevel
+                MODE_MAIN_8X -> ZOOM_MAIN_8X
+                MODE_FRONT -> FRONT_DEFAULT_ZOOM
+                else -> ZOOM_LEVEL_WIDE
+            }
+        }
+        // Guard against an unset, zero or NaN zoom: fall back to the on-screen target size.
+        val irisNormRadius = if (previewZoom > 0f) {
+            MIN_IRIS_SIZE_FRACTION / previewZoom
+        } else {
+            MIN_IRIS_SIZE_FRACTION
         }
 
         // Expand factor: how much padding around the iris
@@ -2666,301 +2500,6 @@ class CameraFragment : Fragment() {
             sensorHeight = fullHeight,
             exifRotationDegrees = exifRotationDegrees
         )
-    }
-
-    /**
-     * Capture a burst of frames and automatically select the top sharpest ones.
-     * This is the main entry point for burst capture with best-frame selection.
-     * NOTE: This is legacy code, kept for reference. New flow uses takeSingleCapture + processAndCropCenterBased.
-     *
-     * @param eye Eye label (e.g., "R", "L")
-     * @param number Capture number
-     * @param mode Capture mode
-     * @param onComplete Callback with the top frames (empty list if failed)
-     */
-    private fun takeBurstWithBestFrame(
-        eye: String,
-        number: Int,
-        mode: String,
-        onComplete: ((List<SharpnessAnalyzer.ScoredImage>) -> Unit)? = null
-    ) {
-        if (cameraDevice == null || captureSession == null) {
-            onComplete?.invoke(emptyList())
-            return
-        }
-
-        Log.d(TAG, "BURST_CAPTURE: Starting burst capture of $BURST_FRAME_COUNT frames")
-
-        // Setup burst capture state
-        synchronized(burstFrameBuffer) {
-            burstFrameBuffer.clear()
-            isBurstCaptureActive = true
-            expectedBurstFrames = BURST_FRAME_COUNT
-            burstCaptureCallback = onComplete
-
-            val cameraLabel = if (isFrontCamera) "Front" else "Back"
-            val irisX = (captureIrisNormX * 100).toInt().coerceIn(0, 100)
-            val irisY = (captureIrisNormY * 100).toInt().coerceIn(0, 100)
-            val irisR = (captureIrisNormRadius * 100).toInt().coerceIn(1, 50)
-            burstBaseFilename = "${viewModel.participantId}_${cameraLabel}_${eye}_${number}_${mode}_IX${irisX}_IY${irisY}_IR${irisR}_BURST"
-        }
-
-        try {
-            val captureBuilder = cameraDevice!!.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE)
-            imageReader?.surface?.let { captureBuilder.addTarget(it) }
-
-            // Note: RAW not captured in burst mode to keep it fast
-            applyCommonCaptureSettings(captureBuilder)
-
-            // FULL SENSOR CAPTURE: Use 1x zoom for maximum quality
-            // Preview stays zoomed (8x) for user visibility, but capture uses full sensor
-            // Iris coordinates in filename allow precise post-processing crop
-            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.R && zoomRatioRange != null) {
-                // Use 1x zoom for capture (full sensor) regardless of preview zoom
-                val captureZoom = ZOOM_LEVEL_WIDE.coerceIn(zoomRatioRange!!.lower, zoomRatioRange!!.upper)
-                captureBuilder.set(CaptureRequest.CONTROL_ZOOM_RATIO, captureZoom)
-                Log.d(TAG, "BURST_CAPTURE: Capture zoom = ${captureZoom}x (full sensor), preview stays zoomed")
-
-                // Set full sensor crop region (no crop = full sensor)
-                activeArraySize?.let { aa ->
-                    captureBuilder.set(CaptureRequest.SCALER_CROP_REGION, aa)
-                }
-            } else {
-                // Fallback for older APIs - use full active array
-                activeArraySize?.let { aa ->
-                    captureBuilder.set(CaptureRequest.SCALER_CROP_REGION, aa)
-                }
-            }
-
-            val rotation = requireActivity().windowManager.defaultDisplay.rotation
-            captureBuilder.set(CaptureRequest.JPEG_ORIENTATION, getOrientation(rotation))
-
-            // Use sequential capture instead of captureBurst for better compatibility
-            // captureBurst causes "Broken pipe" error on some devices
-            val captureCallback = object : CameraCaptureSession.CaptureCallback() {
-                override fun onCaptureStarted(
-                    session: CameraCaptureSession,
-                    request: CaptureRequest,
-                    timestamp: Long,
-                    frameNumber: Long
-                ) {
-                    val tag = request.tag as? String
-                    Log.d(TAG, "BURST_CAPTURE: onCaptureStarted timestamp=$timestamp frame=$frameNumber tag=$tag")
-                    if (tag != null) {
-                        filenameMap[timestamp] = tag
-                    }
-                }
-
-                override fun onCaptureCompleted(
-                    session: CameraCaptureSession,
-                    request: CaptureRequest,
-                    result: TotalCaptureResult
-                ) {
-                    Log.d(TAG, "BURST_CAPTURE: onCaptureCompleted")
-                }
-
-                override fun onCaptureFailed(
-                    session: CameraCaptureSession,
-                    request: CaptureRequest,
-                    failure: android.hardware.camera2.CaptureFailure
-                ) {
-                    Log.e(TAG, "BURST_CAPTURE: Capture failed - reason=${failure.reason}")
-                }
-            }
-
-            // Execute sequential captures with delays for HAL stability
-            Log.d(TAG, "BURST_CAPTURE: Starting sequential capture of $BURST_FRAME_COUNT frames with delays")
-            lifecycleScope.launch(Dispatchers.Main) {
-                for (i in 0 until BURST_FRAME_COUNT) {
-                    try {
-                        val filename = "${burstBaseFilename}_$i"
-                        captureBuilder.setTag(filename)
-                        captureSession?.capture(captureBuilder.build(), captureCallback, backgroundHandler)
-                        Log.d(TAG, "BURST_CAPTURE: Submitted frame $i of $BURST_FRAME_COUNT")
-                        // Add delay between captures to prevent overwhelming the HAL
-                        if (i < BURST_FRAME_COUNT - 1) {
-                            delay(250) // 250ms between captures for HAL stability
-                        }
-                    } catch (e: Exception) {
-                        Log.e(TAG, "BURST_CAPTURE: Failed to capture frame $i", e)
-                    }
-                }
-                Log.d(TAG, "BURST_CAPTURE: All sequential capture requests submitted")
-            }
-
-        } catch (e: CameraAccessException) {
-            Log.e(TAG, "BURST_CAPTURE: Camera access exception", e)
-            isBurstCaptureActive = false
-            onComplete?.invoke(emptyList())
-        }
-    }
-
-    private fun takeBurstPicture(count: Int) {
-        // Legacy method - use takeBurstWithBestFrame instead
-        takeBurstWithBestFrame("Manual", 0, "N", null)
-    }
-
-    /**
-     * Focus Bracketing Burst Capture for Telephoto Iris
-     *
-     * Captures frames at multiple focus distances to ensure at least one frame
-     * has the iris plane in perfect focus. Telephoto lenses have extremely shallow
-     * DOF (~2mm at close range), making precise focus critical for iris texture.
-     *
-     * Focus distances are bracketed around the minimum focus distance:
-     * - Center: minFocusDistance (closest, largest iris)
-     * - Steps: ±FOCUS_BRACKET_STEP_DIOPTERS in both directions
-     *
-     * @param eye Eye label (e.g., "RIGHT", "LEFT")
-     * @param number Capture number
-     * @param mode Capture mode
-     * @param onComplete Callback with quality frames sorted by sharpness
-     */
-    private fun takeFocusBracketBurst(
-        eye: String,
-        number: Int,
-        mode: String,
-        onComplete: ((List<SharpnessAnalyzer.ScoredImage>) -> Unit)? = null
-    ) {
-        if (cameraDevice == null || captureSession == null) {
-            onComplete?.invoke(emptyList())
-            return
-        }
-
-        Log.d(TAG, "FOCUS_BRACKET: Starting focus bracket capture with $FOCUS_BRACKET_STEPS steps")
-
-        // Calculate focus distances to bracket
-        // minFocusDistanceDiopters = closest focus (highest diopter value)
-        // Lower diopters = farther focus
-        val centerDiopters = minFocusDistanceDiopters
-        val halfSteps = FOCUS_BRACKET_STEPS / 2
-
-        // Generate focus distances: center ± steps
-        // We go from slightly farther to closest (increasing diopters)
-        val focusDistances = mutableListOf<Float>()
-        for (i in -halfSteps..halfSteps) {
-            val diopters = (centerDiopters - i * FOCUS_BRACKET_STEP_DIOPTERS)
-                .coerceIn(0f, minFocusDistanceDiopters)  // Can't focus closer than min
-            focusDistances.add(diopters)
-        }
-
-        // Ensure we have exactly FOCUS_BRACKET_STEPS distances
-        while (focusDistances.size < FOCUS_BRACKET_STEPS) {
-            focusDistances.add(centerDiopters)
-        }
-
-        Log.d(TAG, "FOCUS_BRACKET: Focus distances (diopters): ${focusDistances.joinToString { String.format("%.2f", it) }}")
-        Log.d(TAG, "FOCUS_BRACKET: Focus distances (cm): ${focusDistances.joinToString { String.format("%.1f", if (it > 0) 100f/it else Float.MAX_VALUE) }}")
-
-        // Setup burst capture state
-        synchronized(burstFrameBuffer) {
-            burstFrameBuffer.clear()
-            isBurstCaptureActive = true
-            expectedBurstFrames = FOCUS_BRACKET_STEPS
-            burstCaptureCallback = onComplete
-
-            val cameraLabel = if (isFrontCamera) "Front" else "Back"
-            val irisX = (captureIrisNormX * 100).toInt().coerceIn(0, 100)
-            val irisY = (captureIrisNormY * 100).toInt().coerceIn(0, 100)
-            val irisR = (captureIrisNormRadius * 100).toInt().coerceIn(1, 50)
-            burstBaseFilename = "${viewModel.participantId}_${cameraLabel}_${eye}_${number}_${mode}_IX${irisX}_IY${irisY}_IR${irisR}_FBRKT"
-        }
-
-        try {
-            val captureCallback = object : CameraCaptureSession.CaptureCallback() {
-                override fun onCaptureStarted(
-                    session: CameraCaptureSession,
-                    request: CaptureRequest,
-                    timestamp: Long,
-                    frameNumber: Long
-                ) {
-                    val tag = request.tag as? String
-                    val focusDist = request.get(CaptureRequest.LENS_FOCUS_DISTANCE)
-                    Log.d(TAG, "FOCUS_BRACKET: onCaptureStarted timestamp=$timestamp focusDist=$focusDist tag=$tag")
-                    if (tag != null) {
-                        filenameMap[timestamp] = tag
-                    }
-                }
-
-                override fun onCaptureCompleted(
-                    session: CameraCaptureSession,
-                    request: CaptureRequest,
-                    result: TotalCaptureResult
-                ) {
-                    val actualFocusDist = result.get(CaptureResult.LENS_FOCUS_DISTANCE)
-                    Log.d(TAG, "FOCUS_BRACKET: onCaptureCompleted actualFocusDist=$actualFocusDist")
-                }
-
-                override fun onCaptureFailed(
-                    session: CameraCaptureSession,
-                    request: CaptureRequest,
-                    failure: android.hardware.camera2.CaptureFailure
-                ) {
-                    Log.e(TAG, "FOCUS_BRACKET: Capture failed - reason=${failure.reason}")
-                }
-            }
-
-            // Execute sequential captures at different focus distances
-            lifecycleScope.launch(Dispatchers.Main) {
-                for (i in focusDistances.indices) {
-                    try {
-                        val focusDiopters = focusDistances[i]
-                        val focusCm = if (focusDiopters > 0) 100f / focusDiopters else Float.MAX_VALUE
-
-                        // Create capture request with specific focus distance
-                        val captureBuilder = cameraDevice!!.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE)
-                        imageReader?.surface?.let { captureBuilder.addTarget(it) }
-
-                        // Apply common settings (includes OIS and ISP bypass)
-                        applyCommonCaptureSettings(captureBuilder)
-
-                        // Set manual focus for this specific distance
-                        captureBuilder.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_OFF)
-                        captureBuilder.set(CaptureRequest.LENS_FOCUS_DISTANCE, focusDiopters)
-
-                        // FULL SENSOR CAPTURE: Use 1x zoom for maximum quality
-                        // Preview stays zoomed for user visibility, capture uses full sensor
-                        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.R && zoomRatioRange != null) {
-                            val captureZoom = ZOOM_LEVEL_WIDE.coerceIn(zoomRatioRange!!.lower, zoomRatioRange!!.upper)
-                            captureBuilder.set(CaptureRequest.CONTROL_ZOOM_RATIO, captureZoom)
-
-                            // Set full sensor crop region
-                            activeArraySize?.let { aa ->
-                                captureBuilder.set(CaptureRequest.SCALER_CROP_REGION, aa)
-                            }
-                        } else {
-                            activeArraySize?.let { aa ->
-                                captureBuilder.set(CaptureRequest.SCALER_CROP_REGION, aa)
-                            }
-                        }
-
-                        val rotation = requireActivity().windowManager.defaultDisplay.rotation
-                        captureBuilder.set(CaptureRequest.JPEG_ORIENTATION, getOrientation(rotation))
-
-                        // Tag with focus distance info
-                        val filename = "${burstBaseFilename}_F${i}_D${String.format("%.1f", focusDiopters)}_${String.format("%.0f", focusCm)}cm"
-                        captureBuilder.setTag(filename)
-
-                        Log.d(TAG, "FOCUS_BRACKET: Capturing frame $i at ${String.format("%.2f", focusDiopters)} diopters (${String.format("%.1f", focusCm)}cm)")
-
-                        captureSession?.capture(captureBuilder.build(), captureCallback, backgroundHandler)
-
-                        // Brief delay between captures for HAL stability and focus settling
-                        if (i < focusDistances.size - 1) {
-                            delay(150) // Shorter delay since we're changing focus, not waiting for AF
-                        }
-                    } catch (e: Exception) {
-                        Log.e(TAG, "FOCUS_BRACKET: Failed to capture frame $i", e)
-                    }
-                }
-                Log.d(TAG, "FOCUS_BRACKET: All focus bracket capture requests submitted")
-            }
-
-        } catch (e: CameraAccessException) {
-            Log.e(TAG, "FOCUS_BRACKET: Camera access exception", e)
-            isBurstCaptureActive = false
-            onComplete?.invoke(emptyList())
-        }
     }
 
     private fun applyCommonCaptureSettings(builder: CaptureRequest.Builder) {
