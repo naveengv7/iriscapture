@@ -2426,12 +2426,24 @@ class CameraFragment : Fragment() {
         // sharpness measurement). The rejection behaviour below is a best-faith
         // reconstruction and should be reviewed against intended behaviour.
         // Rejecting here avoids running quality assessment on a frame with no eye.
-        val presenceResult = EyePresenceDetector.detect(
-            bitmap = cropResult.croppedBitmap,
-            irisCenter = cropResult.irisCenter,
-            irisRadius = cropResult.irisRadius,
-            isFrontCamera = isFrontCamera
-        )
+        // Guarded like the quality assessment below: detect() allocates two int arrays the
+        // size of the whole crop, so an OOM here would otherwise escape uncaught, leak the
+        // bitmap and abort the entire capture session.
+        val presenceResult = try {
+            EyePresenceDetector.detect(
+                bitmap = cropResult.croppedBitmap,
+                irisCenter = cropResult.irisCenter,
+                irisRadius = cropResult.irisRadius,
+                isFrontCamera = isFrontCamera
+            )
+        } catch (e: Throwable) {
+            Log.e(TAG, "PROCESS_CROP_CENTER: Eye presence detection failed", e)
+            null
+        }
+        if (presenceResult == null) {
+            cropResult.croppedBitmap.recycle()
+            return null
+        }
         Log.d(TAG, "PROCESS_CROP_CENTER: Eye presence: detected=${presenceResult.eyeDetected} " +
                 "confidence=${presenceResult.confidence} reason=${presenceResult.reason}")
         if (!presenceResult.eyeDetected) {

@@ -136,9 +136,14 @@ object EyeImageCropper {
         // Input coordinates are in display space; transform to raw JPEG pixel space
         val (rawNormX, rawNormY) = displayToRawNorm(irisNormX, irisNormY, exifDegrees)
 
-        // Display width determines the iris radius scale
-        // For 90°/270° rotation, display width = rawH; for 0°/180°, display width = rawW
-        val displayWidth = if (exifDegrees == 90 || exifDegrees == 270) rawH else rawW
+        // Display width determines the iris radius scale.
+        // FIXED 2026-09-19: this previously selected the axis from exifDegrees while the
+        // bitmap is rotated by effectiveRotation. Those always differ by 90 degrees, so the
+        // radius was normalised against an axis the crop is never rendered in. On the live
+        // path JPEG_ORIENTATION is never set, so exifDegrees was always 0 and displayWidth
+        // resolved to the sensor long axis, inflating every radius by the aspect ratio
+        // (612 px instead of 461 px on a 4080x3072 still). Use the rotation actually applied.
+        val displayWidth = if (effectiveRotation == 90 || effectiveRotation == 270) rawH else rawW
         val irisRadius = irisNormRadius * displayWidth
 
         // Convert to raw pixel coordinates
