@@ -31,13 +31,25 @@ class LoginFragment : Fragment() {
         super.onViewCreated(view, savedInstanceState)
 
         binding.btnEnter.setOnClickListener {
+            // RESTORED 2026-09-19. HEAD required a 6-digit ID while the layout caps the
+            // field at maxLength=3, so ENTER could never succeed and the app could not get
+            // past this screen. The pre-loss build required 3 digits and also read and
+            // validated the images-per-eye field, which HEAD ignored entirely.
             val id = binding.etParticipantId.text.toString()
-            if (id.length == 6) {
-                viewModel.setParticipantId(id)
-                findNavController().navigate(R.id.action_login_to_permissions)
-            } else {
-                Toast.makeText(requireContext(), "Please enter a 6-digit ID", Toast.LENGTH_SHORT).show()
+            val imagesPerEye = binding.etImagesPerEye.text.toString().toIntOrNull()
+
+            if (id.length != 3) {
+                Toast.makeText(requireContext(), "Please enter a 3-digit ID", Toast.LENGTH_SHORT).show()
+                return@setOnClickListener
             }
+            if (imagesPerEye == null || imagesPerEye < 1 || imagesPerEye > 20) {
+                Toast.makeText(requireContext(), "Images per eye must be between 1 and 20", Toast.LENGTH_SHORT).show()
+                return@setOnClickListener
+            }
+
+            viewModel.setParticipantId(id)
+            viewModel.setImagesPerEye(imagesPerEye)
+            findNavController().navigate(R.id.action_login_to_permissions)
         }
     }
 

@@ -24,9 +24,19 @@ class MainViewModel : ViewModel() {
 
     private var _participantId: String = "P001"
 
+    // Restored 2026-09-19: lost with the working tree. LoginFragment validates this
+    // to 1..20 and stores it here. Default matches the layout hint.
+    private var _imagesPerEye: Int = 5
+
     val participantId: String get() = _participantId
+
+    val imagesPerEye: Int get() = _imagesPerEye
 
     fun setParticipantId(id: String) {
         _participantId = id
+    }
+
+    fun setImagesPerEye(count: Int) {
+        _imagesPerEye = count
     }
 }
