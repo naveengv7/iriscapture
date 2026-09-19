@@ -123,8 +123,12 @@ configuration. There is no model file to download and no extra setup step.
 ## Using the app
 
 1. **Participant screen.** Enter a 3-digit participant ID and the number of images to collect per
-   eye (1 to 20, default 5). The images-per-eye value also scales the attempt cap and the session
-   timeout, so raising it gives the session proportionally more time.
+   eye (1 to 20, default 5). The participant ID is used throughout. The images-per-eye value is
+   validated here and stored on `MainViewModel`, but it does not yet affect capture:
+   `CameraFragment` never reads `viewModel.imagesPerEye` and works to a hardcoded
+   `TARGET_QUALITY_IMAGES_PER_EYE = 5`. Every session therefore collects 5 accepted images per eye
+   whatever is entered, and the per-eye attempt cap is a compile-time constant that does not scale
+   with the entered value either. Wiring the field through to the capture loop is outstanding work.
 2. **Permission screen.** Grant camera access. The screen advances automatically if the permission
    has already been granted.
 3. **Mode screen.** Choose one of three capture configurations:
@@ -137,10 +141,11 @@ configuration. There is no model file to download and no extra setup step.
 4. **Capture screen.** A target circle and crosshair mark where the iris must sit. Move the device
    closer until the iris fills the circle, then press **Capture** to start the automated loop. The
    loop repeats align, focus lock, flash (rear modes only), capture, crop, and quality assessment
-   until the requested number of accepted images is reached, the attempt cap is hit, the session
-   times out, or **Stop** is pressed. The right eye is collected first, then a short countdown
-   announces the switch to the left eye. Accepted and rejected attempts are both reported on
-   screen, rejected ones with a reason.
+   until the target number of accepted images is reached (a fixed 5, see step 1), the per-eye
+   attempt cap is hit, or **Stop** is pressed. Those three are the only exit conditions: there is
+   no session timer. The right eye is collected first, then the app pauses briefly
+   (about three seconds, with no explicit "switch eyes" prompt) and starts the left eye. Accepted
+   and rejected attempts are both reported on screen, rejected ones with a reason.
 
    One toggle is visible on the capture screen, and only in Telephoto mode: `MF` switches to
    manual focus at the minimum focus distance. RAW capture is on by default and its `R` button is
@@ -207,12 +212,16 @@ retries. The composite score is recorded in the filename and in the embedded met
 The implementation describes itself as "ISO/IEC 29794-6 inspired". **It is not a conformant
 implementation of that standard, and no conformance is claimed here.** Several of the individual
 measures were revised in September 2026: one was removed outright because it returned a constant,
-one was corrected because its formula could not detect what it claimed to measure, and one was
-found to be documented as something it never computed. Their behavior should not be inferred from
-their names, and composite scores produced before and after that revision are not comparable with
-each other. One threshold (motion blur) is currently a reasoned starting value awaiting empirical
-re-tuning. Anyone relying on these figures should read the current definitions in
-[`IrisCapture_Documentation.md`](IrisCapture_Documentation.md) and the source directly, and should
+one was corrected because its formula could not detect what it claimed to measure, one was found
+to be documented as something it never computed, and one (usable iris area) was rewritten because
+it measured pixel darkness rather than occlusion and was observed saturating at its maximum on a
+real device, which left a critical gate carrying no information. Their behavior should not be
+inferred from their names, and composite scores produced before and after that revision are not
+comparable with each other. Two sets of constants are currently reasoned starting values awaiting
+empirical tuning: the motion-blur threshold, and the deviation multiplier, sigma floor and
+specular cutoff of the rewritten usable-iris metric. Anyone relying on these figures should read
+the current definitions in [`IrisCapture_Documentation.md`](IrisCapture_Documentation.md) and the
+source directly, and should
 treat the composite score as an acceptance gate internal to this tool rather than as a
 standardized quality value.
 

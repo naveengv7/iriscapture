@@ -41,6 +41,7 @@ import android.hardware.camera2.CameraAccessException
 import android.hardware.camera2.CameraCaptureSession
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraDevice
+import android.hardware.camera2.CameraMetadata
 import android.hardware.camera2.CameraManager
 import android.hardware.camera2.CaptureRequest
 import android.hardware.camera2.CaptureResult
@@ -2121,13 +2122,81 @@ class CameraFragment : Fragment() {
                 Log.d(TAG, "SINGLE_CAPTURE: Added RAW target")
             }
 
-            // Copy settings from preview
-            captureBuilder.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
+            // RESTORED 2026-09-19. Everything from here to the zoom block lived in
+            // applyCommonCaptureSettings / applyOptimalExposureSettings, which were only
+            // reachable from a dead code path, so NONE of this tuning had ever been applied
+            // to a saved image: every capture went through full ISP processing.
+
+            // AF_MODE_AUTO, not CONTINUOUS_PICTURE. The capture loop drives one-shot AF to
+            // FOCUSED_LOCKED before getting here; telling the HAL to resume continuous
+            // autofocus on the still request can release that lock, which made the whole
+            // focus-lock-and-retry procedure have no guaranteed effect on the saved frame.
+            captureBuilder.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_AUTO)
             captureBuilder.set(CaptureRequest.JPEG_QUALITY, 100.toByte())
+
+            // ISP bypass. Edge enhancement invents edges that mask real iris patterns and
+            // noise reduction smooths away the micro-texture the study depends on.
+            if (captureMode == MODE_TELEPHOTO && DISABLE_ISP_FOR_TELEPHOTO) {
+                captureBuilder.set(CaptureRequest.EDGE_MODE, CaptureRequest.EDGE_MODE_OFF)
+                captureBuilder.set(CaptureRequest.NOISE_REDUCTION_MODE, CameraMetadata.NOISE_REDUCTION_MODE_OFF)
+                try {
+                    captureBuilder.set(CaptureRequest.HOT_PIXEL_MODE, CaptureRequest.HOT_PIXEL_MODE_OFF)
+                } catch (e: Exception) {
+                    Log.w(TAG, "SINGLE_CAPTURE: HOT_PIXEL_MODE not supported")
+                }
+                try {
+                    captureBuilder.set(CaptureRequest.SHADING_MODE, CaptureRequest.SHADING_MODE_OFF)
+                } catch (e: Exception) {
+                    Log.w(TAG, "SINGLE_CAPTURE: SHADING_MODE not supported")
+                }
+                Log.d(TAG, "SINGLE_CAPTURE_ISP: bypass ON (edge/noise/hotpixel/shading off)")
+            } else {
+                // NOISE_REDUCTION_MODE_MINIMAL previously crashed the HAL on Pixel 10 Pro at
+                // 8x zoom, so FAST is the deliberate choice for the non-telephoto modes.
+                captureBuilder.set(CaptureRequest.EDGE_MODE, CaptureRequest.EDGE_MODE_HIGH_QUALITY)
+                captureBuilder.set(CaptureRequest.NOISE_REDUCTION_MODE, CameraMetadata.NOISE_REDUCTION_MODE_FAST)
+                Log.d(TAG, "SINGLE_CAPTURE_ISP: standard (edge=HQ, noise=FAST)")
+            }
+
+            // OIS matters at telephoto macro range, where small movement blurs the iris.
+            if (USE_OIS_FOR_TELEPHOTO && hasOisSupport && captureMode == MODE_TELEPHOTO) {
+                captureBuilder.set(
+                    CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE,
+                    CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE_ON
+                )
+                Log.d(TAG, "SINGLE_CAPTURE_OIS: enabled on the still request")
+            }
+
+            // Carry the preview AE/flash state onto the still so the torch-lit exposure the
+            // user aligned under is the exposure that gets captured.
+            previewRequestBuilder?.get(CaptureRequest.CONTROL_AE_MODE)?.let {
+                captureBuilder.set(CaptureRequest.CONTROL_AE_MODE, it)
+            } ?: captureBuilder.set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON)
+            previewRequestBuilder?.get(CaptureRequest.FLASH_MODE)?.let {
+                captureBuilder.set(CaptureRequest.FLASH_MODE, it)
+            }
+
+            // Carry the 3A locks and metering regions the capture loop established.
+            previewRequestBuilder?.get(CaptureRequest.CONTROL_AWB_LOCK)?.let {
+                captureBuilder.set(CaptureRequest.CONTROL_AWB_LOCK, it)
+            }
+            previewRequestBuilder?.get(CaptureRequest.CONTROL_AE_LOCK)?.let {
+                captureBuilder.set(CaptureRequest.CONTROL_AE_LOCK, it)
+            }
+            previewRequestBuilder?.get(CaptureRequest.CONTROL_AF_REGIONS)?.let {
+                captureBuilder.set(CaptureRequest.CONTROL_AF_REGIONS, it)
+            }
+            previewRequestBuilder?.get(CaptureRequest.CONTROL_AE_REGIONS)?.let {
+                captureBuilder.set(CaptureRequest.CONTROL_AE_REGIONS, it)
+            }
+
+            // NOTE: zoom and crop region are deliberately NOT copied from the preview. The
+            // still is captured at 1x full sensor by design, and the iris-radius derivation
+            // in processAndCropCenterBased depends on that.
 
             // IMPORTANT: Capture at 1x zoom (full sensor) for maximum quality
             // Preview stays zoomed for user visibility, but capture uses full sensor
-            // MediaPipe will detect iris from the full-res image
+            // The iris region is cropped from the full-res image afterwards.
             if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.R && zoomRatioRange != null) {
                 val captureZoom = ZOOM_LEVEL_WIDE.coerceIn(zoomRatioRange!!.lower, zoomRatioRange!!.upper)
                 captureBuilder.set(CaptureRequest.CONTROL_ZOOM_RATIO, captureZoom)

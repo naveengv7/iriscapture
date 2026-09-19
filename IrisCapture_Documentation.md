@@ -46,16 +46,20 @@ IrisCapture is an Android application designed for research-grade iris biometric
 
 **Key characteristics:**
 - Zero ML dependencies (no TensorFlow, no MediaPipe at runtime)
-- Camera2 API for full manual control over focus, exposure, ISO, and OIS
+- Camera2 API used directly for focus, zoom, flash and lens selection. **Manual exposure and
+  ISO are not actually applied:** `SENSOR_SENSITIVITY` and `SENSOR_EXPOSURE_TIME` are set
+  nowhere, and the ISO and shutter constants only appear in a log line (section 24)
 - 3 capture modes: Telephoto, Main Camera, Front Camera
 - 5-signal heuristic eye presence detection (no false saves on backgrounds)
 - ISO 29794-6 inspired quality assessment (6 metrics; a 7th, gaze angle, was removed on 2026-09-19)
 - Laplacian variance sharpness analysis
 - Dual-format output: cropped JPEG + full-sensor RAW (DNG) with embedded metadata
-- Configurable images per eye (1-20, default 5)
+- Images-per-eye field on the login screen (1-20, default 5), validated and stored but **not
+  yet wired into the capture loop**, which works to a fixed 5 (see section 6)
 - Automatic right-eye-then-left-eye session management
 
-**Package:** `com.google.mediapipe.examples.facelandmarker` (legacy name retained from original codebase)
+**Package:** `edu.clarkson.iriscapture` (renamed on 2026-09-19 from the inherited
+`com.google.mediapipe.examples.facelandmarker`; see the changelog)
 
 ---
 
@@ -106,27 +110,27 @@ CameraFragment
 
 ## 4. File Inventory
 
-### Source Files (`app/src/main/java/com/google/mediapipe/examples/facelandmarker/`)
+### Source Files (`app/src/main/java/edu/clarkson/iriscapture/`)
 
 | File | Lines | Description |
 |------|-------|-------------|
 | `MainActivity.kt` | 36 | Single-activity host with ViewBinding |
-| `MainViewModel.kt` | 32 | Shared ViewModel: participantId, imagesPerEye |
+| `MainViewModel.kt` | 42 | Shared ViewModel: participantId, imagesPerEye |
 | `IrisMetadata.kt` | 199 | EXIF-embeddable metadata data class with JSON serialization |
-| `EyeImageCropper.kt` | 211 | BitmapRegionDecoder-based ROI extraction with EXIF rotation handling |
+| `EyeImageCropper.kt` | 216 | BitmapRegionDecoder-based ROI extraction with EXIF rotation handling |
 | `EyePresenceDetector.kt` | 672 | 5-signal heuristic eye detection (no ML) |
-| `SharpnessAnalyzer.kt` | 128 | Laplacian variance sharpness scoring |
-| `IrisQualityAssessor.kt` | 720 | ISO 29794-6 inspired quality assessment (6 metrics) |
+| `SharpnessAnalyzer.kt` | 108 | Laplacian variance sharpness scoring |
+| `IrisQualityAssessor.kt` | 771 | ISO 29794-6 inspired quality assessment (6 metrics) |
 | `OverlayView.kt` | 391 | Custom View for iris target, crosshair, quality panel |
 
 ### Fragment Files (`fragment/`)
 
 | File | Lines | Description |
 |------|-------|-------------|
-| `LoginFragment.kt` | 48 | Participant ID and images-per-eye input |
+| `LoginFragment.kt` | 60 | Participant ID and images-per-eye input |
 | `PermissionsFragment.kt` | 92 | Camera permission request |
 | `ModeSelectionFragment.kt` | 74 | Capture mode selection cards |
-| `CameraFragment.kt` | ~3039 | Main camera pipeline, capture loop, focus, save |
+| `CameraFragment.kt` | 2843 | Main camera pipeline, capture loop, focus, save |
 
 ### Layout Files (`res/layout/`)
 
@@ -184,18 +188,31 @@ powershell.exe -Command ".\gradlew.bat assembleDebug 2>&1"
 - **Enter Button:** Validates inputs, stores in `MainViewModel`, navigates to permissions
 
 ### Validation Rules
-- Participant ID must be exactly 3 digits
-- Images per eye must be integer between 1 and 20 inclusive
-- `MainViewModel.setImagesPerEye()` uses `coerceIn(1, 20)` for safety
+- Participant ID must be exactly **3** digits, and the layout caps the field at `maxLength="3"`
+- Images per eye must be an integer between 1 and 20 inclusive
+- Both checks live in `LoginFragment`; a failure raises a `Toast` and blocks navigation
+- `MainViewModel.setImagesPerEye()` stores the value exactly as given and does **not** clamp it,
+  so the 1-20 range is enforced only by the fragment
 
-### Dynamic Scaling
-The images-per-eye value drives three dynamic properties in `CameraFragment`:
+**Restored 2026-09-19.** The build immediately before this revision required a **6**-digit ID
+while the layout capped the field at three characters, so ENTER could never succeed and the app
+could not get past its first screen. The same build ignored the images-per-eye field entirely.
+Both the 3-digit rule and the images-per-eye validation were restored.
 
-| Property | Formula | Example (10 images) |
-|----------|---------|---------------------|
-| `targetQualityImagesPerEye` | `viewModel.imagesPerEye` | 10 |
-| `maxCaptureAttemptsPerEye` | `maxOf(30, imagesPerEye * 6)` | 60 |
-| `totalSessionTimeoutMs` | `maxOf(90_000, imagesPerEye * 2 * 9_000)` | 180,000ms (3 min) |
+### Images per eye is stored but not yet used
+
+**Corrected 2026-09-19.** This section previously claimed that the images-per-eye value scaled
+three properties in `CameraFragment`: the target image count, the attempt cap and a session
+timeout. **That was false.** `LoginFragment` validates the value and `MainViewModel` holds it, but
+`CameraFragment` never reads `viewModel.imagesPerEye`. What the capture loop actually uses:
+
+| Property | Actual value | Scales with images per eye? |
+|----------|--------------|------------------------------|
+| Target accepted images per eye | `TARGET_QUALITY_IMAGES_PER_EYE`, a compile-time constant of 5 | No |
+| Attempt cap per eye | `MAX_CAPTURE_ATTEMPTS_PER_EYE`, a compile-time constant | No |
+
+Every session therefore collects **5** accepted images per eye whatever the operator enters.
+Wiring the stored value through to the loop is outstanding work, not current behaviour.
 
 ---
 
@@ -220,7 +237,7 @@ Each card navigates to `CameraFragment` with a `capture_mode` argument bundle.
 
 ## 8. Camera Fragment - Core Pipeline
 
-**File:** `CameraFragment.kt` (~3039 lines)
+**File:** `CameraFragment.kt` (2843 lines)
 
 ### Overall Pipeline (per attempt)
 
@@ -273,8 +290,9 @@ Each card navigates to `CameraFragment` with a `capture_mode` argument bundle.
 - **Capture zoom:** 1x (full sensor); iris coordinates map preview-to-capture
 - **Focus:** Auto with 6% metering region, or Manual at minimum focus distance
 - **Flash:** Torch mode on rear cameras, turned on AFTER focus lock
-- **OIS:** Enabled if available (`LENS_OPTICAL_STABILIZATION_MODE_ON`)
-- **ISP bypass:** Edge enhancement OFF, noise reduction OFF, hot pixel OFF, shading OFF
+- **OIS:** `LENS_OPTICAL_STABILIZATION_MODE_ON` is applied **to the preview request only**,
+  never to the still capture request (see "ISP and OIS never reached a saved image" below)
+- **ISP bypass:** **not applied.** No saved image has ever had it (see below)
 - **Iris radius:** `0.15 / previewZoom` (see "Iris radius derivation" below): `0.15` on a physical
   telephoto lens driven at 1x, `0.05` when telephoto is reached by 3x zoom on the main camera
 
@@ -285,7 +303,8 @@ Each card navigates to `CameraFragment` with a `capture_mode` argument bundle.
 - **Capture zoom:** 1x (full sensor)
 - **Focus:** Auto with standard metering
 - **Flash:** Torch mode
-- **ISP:** Standard settings (edge HIGH_QUALITY, noise FAST)
+- **ISP:** whatever `TEMPLATE_STILL_CAPTURE` defaults to; the app sets no ISP keys on the still
+  request (see below)
 - **Iris radius:** `0.15 / 4.0 = 0.0375` (see "Iris radius derivation" below)
 
 ### Mode: Front Camera (`MODE_FRONT`)
@@ -295,9 +314,44 @@ Each card navigates to `CameraFragment` with a `capture_mode` argument bundle.
 - **Capture zoom:** 1x
 - **Focus:** Continuous auto
 - **Flash:** None (no front flash)
-- **ISP:** Standard settings
+- **ISP:** whatever `TEMPLATE_STILL_CAPTURE` defaults to; the app sets no ISP keys on the still
+  request (see below)
 - **Iris radius:** `0.15 / 1.25 = 0.12` (see "Iris radius derivation" below)
 - **Expand factor:** 1.2x (tighter crop than rear cameras)
+
+### ISP and OIS never reached a saved image
+
+**Corrected 2026-09-19.** Earlier revisions of this document listed an ISP bypass and a
+capture-side OIS enable as active tuning on the telephoto mode. **They were never applied to any
+captured image.** `EDGE_MODE_OFF`, `NOISE_REDUCTION_MODE_OFF`, `SHADING_MODE_OFF`, the hot-pixel
+setting, the capture-side OIS enable and the AE/flash copying all lived in
+`applyCommonCaptureSettings()` and `applyOptimalExposureSettings()`, which were only ever reachable
+from the `takePicture` chain. That chain was unreachable and was deleted on 2026-09-19, and the
+helpers went with it. Every image this application has ever saved therefore went through **full ISP
+processing, including denoising and edge enhancement**, which for a study of iris texture is a
+material fact about the existing data as well as about current behaviour.
+
+What the live still request, `takeSingleCapture()`, actually sets on its
+`TEMPLATE_STILL_CAPTURE` builder is only: the JPEG and (when supported) RAW targets,
+`CONTROL_AF_MODE_CONTINUOUS_PICTURE`, `JPEG_QUALITY = 100`, `CONTROL_ZOOM_RATIO` at 1x and
+`SCALER_CROP_REGION` covering the full active array. Everything else, ISP included, is left at the
+template default.
+
+Consequences worth recording:
+
+- `DISABLE_ISP_FOR_TELEPHOTO` (still declared `true`) is now an **orphaned constant**: it is
+  referenced nowhere in the source. Its presence in section 24 is a record of a setting that does
+  nothing.
+- `USE_OIS_FOR_TELEPHOTO` (also `true`) is still live, but only where it sets
+  `LENS_OPTICAL_STABILIZATION_MODE_ON` on the **preview** request builder. The still request
+  carries no OIS key of its own.
+- Flash is likewise set only on the preview request, as `FLASH_MODE_TORCH`. Torch is a continuous
+  state rather than a per-frame flash, so the scene is lit while the still is taken, but the still
+  request carries no `FLASH_MODE` or AE key of its own and the app copies none across.
+
+This is recorded here as a factual correction. Whether the tuning should be restored to the live
+still path is a research decision and is **not** decided by this document; it is tracked as an open
+item in limitation 14.
 
 ### Iris radius derivation
 
@@ -336,8 +390,17 @@ zoom by falling back to the bare on-screen target size (0.15).
 | Front Camera | 1.25x | 0.05 | **0.12** |
 
 This radius drives every polar sampling grid in `IrisQualityAssessor` as well as the crop
-rectangle, so the corrected values change quality scores on all modes except `MAIN_8X`. The
-derived values still need confirmation against real captures on a device.
+rectangle, so the corrected values change quality scores on all modes except `MAIN_8X`.
+
+**These figures are only valid now that zoom is expressed once.** The table assumes the still is
+magnified by exactly the preview zoom Z that `CONTROL_ZOOM_RATIO` reports. Until the double-zoom
+fix of 2026-09-19 (section 11) that was not true: `setZoom()` set the ratio **and** narrowed the
+crop region, so a conforming HAL magnified by `Z * Z` while this derivation read back `Z`. Every
+derived radius was therefore additionally wrong by a further factor of Z. Telephoto on a physical
+lens is the exception, because Z is 1.0 there and `Z * Z` is the same number; the zoom-based
+telephoto, `MAIN_8X` and front-camera rows were all affected. Any radius, crop size or quality
+score measured on a device before that fix, including the front-camera numbers in the section 23
+validation record, was produced under the doubled magnification and needs re-measuring.
 
 ---
 
@@ -393,10 +456,34 @@ Enumerates all cameras matching the target facing direction:
 
 ### Zoom Implementation
 
-**API 30+ (preferred):** `CONTROL_ZOOM_RATIO` + `SCALER_CROP_REGION`
-**Legacy:** `SCALER_CROP_REGION` only (center crop based on zoom ratio)
+**Corrected 2026-09-19: zoom used to be applied twice.**
 
-Both paths set crop region for consistent behavior. Zoom is applied to both preview and capture requests (preview zoomed for alignment, capture at 1x for quality).
+**API 30+ (preferred), when `zoomRatioRange` is available:** zoom is expressed **once**, through
+`CONTROL_ZOOM_RATIO`. `SCALER_CROP_REGION` is then set to the **full active array**, which in
+post-zoom coordinates means "the whole zoomed field of view", that is, no extra crop. It is set
+explicitly rather than left out, because `previewRequestBuilder` is long lived and an omitted key
+would leave whatever narrowed rectangle an earlier request had put there.
+
+The previous code set the ratio and *also* narrowed the crop to `activeArray / z`. The Camera2
+contract is that once `CONTROL_ZOOM_RATIO` is anything other than 1.0, `SCALER_CROP_REGION` is
+interpreted in the **post-zoom** coordinate system, so a HAL that honours both keys reads that as a
+second z-fold crop on top of the ratio. Effective magnification was `z * z`: 4x asked for, 16x
+delivered. Expect the preview to look less magnified than it used to, and confirm that the
+on-screen target is still fillable at a comfortable standoff distance in every mode.
+
+**Legacy (below API 30, or no zoom ratio range):** unchanged. `CONTROL_ZOOM_RATIO` does not exist
+there, so `SCALER_CROP_REGION` is the only way to zoom and it is in **active array** coordinates.
+Narrowing it to `activeArray / z` around the requested centre is correct on that path, and that is
+still what happens.
+
+**Why this mattered beyond the preview.** `processAndCropCenterBased()` derives the iris radius by
+reading `CONTROL_ZOOM_RATIO` back off the same builder, so it saw `z` while the still was actually
+magnified by `z * z`, making every crop radius wrong by a further factor of `z`. The derivation is
+only self-consistent while the ratio is the sole expression of zoom. See section 9.
+
+**Preview versus still.** The preview runs at the mode's zoom for alignment; `takeSingleCapture()`
+builds its own `TEMPLATE_STILL_CAPTURE` request at 1x over the full active array, so the still is
+always full sensor.
 
 ---
 
@@ -407,10 +494,9 @@ Both paths set crop region for consistent behavior. Zoom is applied to both prev
 ### Loop Logic
 
 ```kotlin
-while (qualityCount < targetQualityImagesPerEye &&
-       attemptCount < maxCaptureAttemptsPerEye &&
-       isAutomatedCaptureRunning &&
-       (elapsedTime) < totalSessionTimeoutMs) {
+while (qualityCount < TARGET_QUALITY_IMAGES_PER_EYE &&
+       attemptCount < MAX_CAPTURE_ATTEMPTS_PER_EYE &&
+       isAutomatedCaptureRunning) {
 
     val qualityFromBurst = performTelephotoCaptureSingle(isRightEye)
     qualityCount += qualityFromBurst  // 0 or 1; the variable name is a leftover,
@@ -421,13 +507,46 @@ while (qualityCount < targetQualityImagesPerEye &&
 ```
 
 ### Exit Conditions (any one triggers exit)
-1. Quality images reached target count
-2. Attempt count reached maximum
-3. User pressed Stop
-4. Session timeout exceeded
+1. Accepted images reached the target count, `TARGET_QUALITY_IMAGES_PER_EYE`, a compile-time
+   constant of 5 (it does not track the images-per-eye login field, see section 6)
+2. Attempt count reached `MAX_CAPTURE_ATTEMPTS_PER_EYE`, a compile-time constant of 30
+3. User pressed Stop, which clears `isAutomatedCaptureRunning`
+
+**Corrected 2026-09-19: there is no session timeout.** This section previously showed a fourth
+loop term, `elapsedTime < totalSessionTimeoutMs`, and listed "session timeout exceeded" as a
+fourth exit condition. No such constant or elapsed-time check exists in `CameraFragment`; the only
+timeout in the whole file is `FOCUS_LOCK_TIMEOUT_MS` (3000 ms), which bounds a single autofocus
+wait, not the session. The two loop bounds above and the Stop button are the only things that end
+a session. See limitation 8.
 
 ### Eye Switching
-After right eye completes, there's a 7-second countdown with status messages: "Switching to LEFT eye in Xs..."
+
+When the right eye finishes, the loop calls `unlock3AAndZoomOutTo1x(keepZoom = true)`, waits
+`delay(1500)` and starts the left-eye loop.
+
+**Corrected 2026-09-19, two separate errors.**
+
+*The countdown does not exist.* This section used to describe "a 7-second countdown with status
+messages: Switching to LEFT eye in Xs...". There is no countdown and no such status message in the
+source. The gap between eyes is a flat 1500 ms, preceded by the closing status line of the
+right-eye loop and its own 1500 ms pause, so the participant gets roughly three seconds with no
+explicit instruction to switch eyes. Worth revisiting as a usability matter, but documented here as
+it behaves.
+
+*The left eye used to be captured at a different zoom from the right.* **Any telephoto data
+collected before 2026-09-19 has mismatched left and right eyes.** The telephoto branch called
+`unlock3AAndZoomOutTo1x(keepZoom = false)`, which reset zoom to 1x with nothing re-applying it
+afterwards. The right eye was therefore captured at 3x and the left eye at 1x, against an
+on-screen alignment target that is the same size for both, so the participant would have had to
+stand at a completely different distance for the left eye (on a zoom-based telephoto device roughly
+3x closer, likely inside the minimum focus distance), and the iris radius that
+`processAndCropCenterBased()` derives from the applied preview zoom was wrong for the left eye as
+well. The flag had been tied to `USE_LANDSCAPE_FOR_TELEPHOTO`, a screen-orientation constant that
+has nothing to do with zoom and is `false`. The branch now passes `keepZoom = true`, matching the
+`MAIN_8X` and `FRONT` branch, which always did. The 3A reset that is the real purpose of the call
+(release the AE and AWB locks, cancel the AF trigger, clear the AF and AE regions, so the left eye
+gets a fresh focus and metering cycle) is preserved, and the end-of-session reset back to 1x still
+happens in `resetAfterCapture()`, which calls the same function with `keepZoom = false`.
 
 ---
 
@@ -465,17 +584,26 @@ The metering rectangle is centered on the sensor active array center, applied to
 
 ### Focus Timing Optimization
 
-| Phase | First Attempt | Subsequent |
-|-------|---------------|------------|
-| Alignment delay | 4000ms | 500ms |
-| Focus stabilization | 300-500ms | Skipped |
-| Focus lock timeout | 2000ms | 2000ms |
+**Corrected 2026-09-19 against the source.** The table that stood here described an adaptive
+scheme (a shorter alignment delay on subsequent attempts, a skipped focus settle, a 2000 ms focus
+timeout and 2 retries) that **is not in the current code**. The live values are:
+
+| Phase | Value | Constant |
+|-------|-------|----------|
+| Alignment delay | 4000 ms, every attempt, not just the first | literal `delay(4000)` |
+| Focus settle | 500 ms with manual focus, 1500 ms otherwise | literal `delay(if (useManualFocus) 500 else 1500)` |
+| Focus lock timeout | 3000 ms | `FOCUS_LOCK_TIMEOUT_MS` |
+| Focus retries | 3 | `FOCUS_RETRY_COUNT` |
+| Inter-attempt pause | 2000 ms | literal `delay(2000)` |
+
+The adaptive scheme appears to have been lost along with the rest of the working tree rather than
+deliberately reverted, but it is not present, so it is not documented as behaviour. See section 22.
 
 ---
 
 ## 14. Eye Image Cropper
 
-**File:** `EyeImageCropper.kt` (220 lines)
+**File:** `EyeImageCropper.kt` (216 lines)
 **Type:** `object` singleton
 
 ### Purpose
@@ -485,7 +613,11 @@ Extracts the eye region from a full-resolution JPEG using BitmapRegionDecoder (m
 - `jpegBytes`: Full JPEG bytes
 - `irisNormX`, `irisNormY`: Normalized iris center (0-1, display space)
 - `irisNormRadius`: Normalized iris radius (relative to display width)
-- `expandFactor`: Padding multiplier (default 4.0x for rear, 1.2x for front)
+- `expandFactor`: Padding multiplier. **Corrected 2026-09-19.** The only live caller,
+  `CameraFragment.processAndCropCenterBased()`, passes **2.0x for the rear modes** (Telephoto and
+  Main Camera) and **1.2x for the front camera**, so those are the values that actually run. The
+  parameter's declared default of `4.0f` is never used, because every call site supplies the
+  argument explicitly; this line previously reported that unused default as the rear value.
 - `isFrontCamera`: Affects rotation correction
 
 ### Coordinate Transform Pipeline
@@ -500,6 +632,15 @@ Display Space (normalized 0-1)
 ```
 
 ### EXIF Rotation Handling
+
+**`JPEG_ORIENTATION` is now set nowhere (noted 2026-09-19).** The only code that ever set
+`CaptureRequest.JPEG_ORIENTATION` lived on the `takePicture` chain, which was unreachable and was
+deleted on 2026-09-19. Stills therefore carry EXIF orientation **0**. That was already true before
+the deletion, since the live path never ran the code that set it, but it is now structural rather
+than incidental: nothing in the source can set it. The cropper does not depend on the tag being
+meaningful, because it compensates through `effectiveRotation` below, and this is also why
+`exifDegrees` is always 0 on the live path, which is what made the crop-axis bug (section 27,
+entry 6) possible.
 
 The EXIF rotation handling accounts for device-specific differences:
 
@@ -523,11 +664,23 @@ val effectiveRotation = if (isFrontCamera) {
 
 ## 15. Eye Presence Detector
 
-**File:** `EyePresenceDetector.kt` (703 lines)
+**File:** `EyePresenceDetector.kt` (672 lines)
 **Type:** `object` singleton
 
 ### Purpose
 Heuristic-based eye presence validation to prevent saving images when no eye is in the frame (e.g., white backgrounds, skin, random objects). Uses 5 complementary signals with no ML dependency.
+
+**Wired into the pipeline on 2026-09-19.** This section previously described the detector as
+though it had always been part of the capture path. It had not: the class existed and was
+documented, but nothing called it, so no frame was ever rejected for containing no eye. Its call
+site was lost with the working tree and was reconstructed on 2026-09-19 from the position it
+occupied in the pre-loss build. `processAndCropCenterBased()` now invokes
+`EyePresenceDetector.detect()` on the cropped eye image, **between the crop and the sharpness
+measurement**, and rejects the attempt when no eye is detected, so quality assessment no longer
+runs on eyeless frames. The call is wrapped in a `try/catch` because `detect()` allocates two int
+arrays the size of the whole crop and an uncaught OOM there would leak the bitmap and abort the
+session. The rejection behaviour is a best-faith reconstruction and should be reviewed against
+intended behaviour; the signal weights and thresholds below were never lost and are unchanged.
 
 ### Signal Architecture
 
@@ -618,7 +771,7 @@ eyeDetected = (composite >= 0.28) AND geometricPass
 
 ## 16. Sharpness Analyzer
 
-**File:** `SharpnessAnalyzer.kt` (128 lines)
+**File:** `SharpnessAnalyzer.kt` (108 lines)
 **Type:** `object` singleton
 
 ### Algorithm
@@ -668,7 +821,7 @@ they remain valid. Do not blend another score into this metric without re-tuning
 
 ## 17. Iris Quality Assessor (ISO 29794-6 Inspired)
 
-**File:** `IrisQualityAssessor.kt` (720 lines)
+**File:** `IrisQualityAssessor.kt` (771 lines)
 **Type:** `object` singleton
 
 The source describes itself as "ISO 29794-6 inspired". This is **not** a conformant implementation
@@ -679,9 +832,9 @@ internal to this application.
 
 | # | Metric | Weight | Critical | Threshold | Description |
 |---|--------|--------|----------|-----------|-------------|
-| 1 | Usable Iris Area | 0.2222 | Yes | 50% (rear), 35% (front) | Fraction of iris annulus not occluded by eyelids |
+| 1 | Usable Iris Area | 0.2222 | Yes | ≥ 0.50 unoccluded (rear), ≥ 0.35 (front) | Fraction of the iris annulus not occluded by eyelid, eyelash or glare, judged against the iris's own intensity distribution (rewritten 2026-09-19) |
 | 2 | Pupil-to-Iris Ratio | 0.1111 | No | 0.20 - 0.70 | Optimal at 0.45 |
-| 3 | Iris-Pupil Contrast | 0.1667 | Yes | ≥ 0.40 (rear), ≥ 0.10 (front) | Weber contrast between pupil and iris zones |
+| 3 | Iris-Pupil Contrast | 0.1667 | Yes | ≥ 0.40 (rear), ≥ 0.10 (front) | Weber contrast between pupil and iris zones. The threshold is supplied by the caller: `CameraFragment` passes `if (captureMode == MODE_FRONT) 0.10f else 0.4f`; `CONTRAST_THRESHOLD = 0.4f` in `IrisQualityAssessor` is only the parameter default |
 | 4 | Illumination Uniformity | 0.1111 | No | ≥ 0.50 | 8-sector angular uniformity, specular penalty |
 | 5 | Motion Blur | 0.1667 | No | ≤ 6.0 anisotropy (provisional) | Gradient orientation histogram peak / full-histogram mean |
 | 6 | Sharpness | 0.2222 | Yes | Mode-specific (see section 16) | Reuses the SharpnessAnalyzer score |
@@ -725,11 +878,78 @@ Sharpness. Gaze Angle used to be the fourth.
 
 ### Metric Details
 
-#### Metric 1: Usable Iris Area
-- **With landmarks:** Polar grid sampling in iris annulus, check against eyelid polylines
-- **Intensity fallback (no landmarks):** Radial scan, count dark pixels (iris-like intensity)
-  - Rear camera threshold: intensity < 180 (flash makes iris darker)
-  - Front camera threshold: intensity < 220 (ambient light makes iris brighter)
+#### Metric 1: Usable Iris Area (rewritten 2026-09-19)
+
+Returns the fraction of the iris annulus that is usable iris texture, that is, **not** occluded by
+eyelid, eyelash or specular glare. Two paths exist:
+
+- **With eyelid landmarks** (`computeUsableIrisAreaWithLandmarks()`): polar grid sampling inside
+  the annulus, each sample tested against the upper and lower eyelid polylines. This path is dead
+  in the current build, because `EyeImageCropper` always passes null landmark lists (limitation 4),
+  so it is never taken.
+- **Without landmarks** (`computeUsableIrisAreaIntensity()`, the live path): an adaptive,
+  distribution-relative occlusion measure, described below.
+
+**Why it was rewritten.** The previous implementation counted annulus samples whose intensity fell
+below a fixed absolute threshold (180 on rear cameras, 220 on the front camera) and returned that
+fraction. That measures pixel *darkness*, not occlusion, and it failed in both directions:
+
+- On a dark iris every sample fell below the threshold, so the metric returned exactly 1.0 however
+  much eyelid was covering the iris. This was confirmed saturating on a real device, logging
+  `darkCount=180 totalCount=180 ratio=1.0` and a normalized score of 100.0. Since this is a
+  **critical** gate, a value pinned at 1.0 carried no information at all and could never reject
+  anything.
+- A light blue or grey iris, correctly exposed, sits *above* those thresholds. The same metric
+  would have failed such a participant on a critical gate for being correctly exposed.
+
+**How the current version works.** The sampling geometry is unchanged, so sample counts stay
+comparable with previously logged values: 36 angles by 5 radii across the annulus, from
+`0.4 * irisRadius` out to `irisRadius`. What changed is the decision rule, which is now relative to
+the iris itself rather than to an absolute grey level:
+
+1. Collect the in-bounds annulus samples as 8-bit luma. Fewer than 20 usable samples returns a
+   neutral 0.5.
+2. Derive a robust centre and spread **from those samples**: the `median`, then the median absolute
+   deviation `mad`, converted to a standard-deviation equivalent by the usual factor 1.4826 and
+   floored so that a nearly flat crop does not flag everything:
+   `sigma = max(mad * 1.4826, USABLE_IRIS_MIN_SIGMA)`, and `band = USABLE_IRIS_DEVIATION_K * sigma`.
+3. Count a sample as occluded when it departs from that distribution:
+   - `gray >= USABLE_IRIS_SPECULAR_CUTOFF` (250): near-saturated, glare hiding the texture;
+   - `gray > median + band`: much brighter than the iris, so eyelid skin or sclera;
+   - `gray < median - band`: much darker than the iris, so eyelash or deep shadow.
+4. Return `1 - occludedFraction`, clamped to 0..1. The three occlusion counts are logged separately
+   (`bright`, `dark`, `specular`) alongside the median, mad, sigma and band.
+
+Because the reference is the iris's own distribution, the metric behaves the same way for any iris
+colour and under any overall exposure, which is exactly what the absolute-threshold version could
+not do. `IRIS_INTENSITY_THRESHOLD_REAR` and `IRIS_INTENSITY_THRESHOLD_FRONT` were deleted with the
+old implementation. The `isFrontCamera` flag is still threaded into the function, but it now only
+appears in the log line; the only remaining front/rear difference is the pass threshold, discussed
+below.
+
+**Known limitation, stated in the source.** If more than half of the annulus is occluded, the
+median describes the **occluder** rather than the iris, and the metric **over-reports usability**:
+the occluder becomes the reference and the still-visible iris starts to look like the outlier.
+Occlusion that heavy is expected to be caught instead by the eye-presence detector (section 15) and
+by the contrast metric, but this metric on its own cannot be trusted in that regime.
+
+**The new constants are reasoned starting points and are NOT empirically tuned.**
+`USABLE_IRIS_SPECULAR_CUTOFF = 250`, `USABLE_IRIS_DEVIATION_K = 2.5f` and
+`USABLE_IRIS_MIN_SIGMA = 4.0f` were chosen by argument, not measured against a capture set. They
+need validating on real captures before this gate is trusted, exactly as `MOTION_BLUR_THRESHOLD`
+does (limitation 11).
+
+**For the researcher: the front/rear pass threshold split needs re-examining.**
+`USABLE_IRIS_THRESHOLD = 0.50` and `USABLE_IRIS_THRESHOLD_FRONT = 0.35` are unchanged in value but
+have changed in meaning. They now mean *"fraction of the annulus that is unoccluded"*; before the
+rewrite they meant *"fraction of samples that are dark"*. Those are different quantities, and the
+bars were never re-derived for the new one. A lower bar for the front camera was defensible for a
+darkness count, because the front camera has no flash and its images are brighter overall, so fewer
+samples fall below an absolute dark threshold. It is questionable for an occlusion measure: how
+much eyelid, eyelash or glare covers the iris is a property of the participant and the framing, not
+of which camera took the picture. **Recommendation:** re-examine the split, most likely collapsing
+it to a single bar, and re-derive that bar from annotated captures rather than carrying the old
+pair forward.
 
 #### Metric 2: Pupil-to-Iris Ratio
 - Radial intensity profile from iris center outward (36 angles × 20 radial steps)
@@ -751,8 +971,13 @@ Gradient orientation anisotropy over the iris bounding box, weighted by gradient
 
 - **36 bins over `[0, pi)`**, so each bin spans **5 degrees**. Gradient orientation is mod pi, not
   mod 2pi, so the `atan2` result is folded into `[0, pi)` before binning.
-- Sobel gradients; samples with magnitude below 5 are skipped. An ROI smaller than 5 by 5 pixels
-  returns the isotropic floor.
+- Sobel gradients; samples with magnitude below 5 are skipped.
+- **Degenerate inputs return the threshold, not the floor (changed 2026-09-19).** An ROI smaller
+  than 5 by 5 pixels, and an ROI in which no gradient clears the magnitude floor, both return
+  `MOTION_BLUR_THRESHOLD`, which maps to a neutral score of 50. They previously returned
+  `MOTION_BLUR_ISOTROPIC`, scoring a perfect 100 on a metric worth a sixth of the composite, so
+  a blank or blown-out crop was rewarded for having nothing to measure. Rejecting such a crop is
+  the sharpness metric's job, not this one's.
 - **Anisotropy = peak bin / mean over the FULL histogram**, giving a range of **1.0** (every bin
   equal, perfectly isotropic, no directional blur) to **36.0** (all gradient energy in a single
   5 degree bin, perfectly directional).
@@ -800,7 +1025,7 @@ same warning.
 
 ## 18. Iris Metadata & EXIF Embedding
 
-**File:** `IrisMetadata.kt` (200 lines)
+**File:** `IrisMetadata.kt` (199 lines)
 
 ### Data Class Fields
 
@@ -906,7 +1131,7 @@ takeSingleCapture() → JPEG callback → processAndCropCenterBased()
 
 ## 20. Overlay View
 
-**File:** `OverlayView.kt` (390 lines)
+**File:** `OverlayView.kt` (391 lines)
 
 ### Visual Elements
 
@@ -983,22 +1208,32 @@ Uses `ContentResolver` with `MediaStore.Images.Media.EXTERNAL_CONTENT_URI`. On A
 
 ### Capture Timing (per attempt)
 
-| Phase | Duration | Optimization |
-|-------|----------|--------------|
-| Alignment delay | 4000ms (first) / 500ms (subsequent) | Adaptive: user already positioned after first attempt |
-| Focus settling | 300-500ms (first) / skipped (subsequent) | AF runs during alignment delay |
-| Focus lock | ≤2000ms | Reduced timeout from 3000ms, 2 retries (down from 3) |
-| Flash stabilization | 150ms | Reduced from 1000ms (minimize pupil constriction) |
-| Capture | ~200ms | Single shot |
-| Eye crop | ~50-100ms | BitmapRegionDecoder (ROI only, not full 12MP) |
-| Eye presence check | ~5-10ms | Shared grayscale, efficient sampling |
-| Sharpness | ~30-50ms | Single Laplacian pass over the centre 50% of the already-cropped eye image |
-| Quality assessment | ~20-40ms | Polar grid sampling |
-| JPEG save | ~50ms | MediaStore ContentResolver |
-| RAW save | ~1-3s | Parallel with JPEG via coroutine async |
-| Inter-attempt delay | 500ms | Reduced from 2000ms |
+**Corrected 2026-09-19.** The table that stood here described a February 2026 timing
+optimization (adaptive alignment delay, skipped focus settle, a 2000 ms focus timeout with 2
+retries, a 500 ms inter-attempt delay) that **is not present in the current source**. Those
+reductions appear to have been lost with the working tree rather than reverted on purpose. The
+figures below are what the code does now: fixed delays read from the source, and measured stage
+costs carried over from the earlier revision where the stage itself did not change.
 
-**Estimated total per attempt:** ~1.5s (subsequent) to ~5s (first)
+| Phase | Duration | Source |
+|-------|----------|--------|
+| Alignment delay | 4000ms, on **every** attempt | literal `delay(4000)`, not adaptive |
+| Focus settling | 500ms with manual focus, 1500ms otherwise | literal `delay(if (useManualFocus) 500 else 1500)` |
+| Focus lock | up to 3000ms, 3 retries | `FOCUS_LOCK_TIMEOUT_MS`, `FOCUS_RETRY_COUNT` |
+| Flash stabilization | 150ms, plus 50ms post-flash | `FLASH_STABILIZATION_DELAY_MS`, `POST_FLASH_CAPTURE_DELAY_MS` |
+| Capture | ~200ms | Single shot, measured |
+| Eye crop | ~50-100ms | BitmapRegionDecoder (ROI only, not full 12MP), measured |
+| Eye presence check | ~5-10ms | Shared grayscale, efficient sampling, measured |
+| Sharpness | ~30-50ms | Single Laplacian pass over the centre 50% of the already-cropped eye image, measured |
+| Quality assessment | ~20-40ms | Polar grid sampling, measured |
+| JPEG save | ~50ms | MediaStore ContentResolver, measured |
+| RAW save | ~1-3s | Parallel with JPEG via coroutine async, measured |
+| Inter-attempt delay | 2000ms | literal `delay(2000)` |
+
+**Fixed delays alone come to roughly 7.7 seconds per attempt** (4000 alignment + 1500 focus settle
++ 150 + 50 flash + 2000 inter-attempt), before any of the measured stage costs or the focus lock
+wait. A 30-attempt eye is therefore a multi-minute exercise. The earlier "~1.5s per attempt"
+estimate described the optimized scheme and no longer applies.
 
 ### Memory Optimizations
 - **BitmapRegionDecoder** for ROI extraction in `EyeImageCropper` (never decodes the full 12MP
@@ -1032,6 +1267,42 @@ The app automatically adapts to device capabilities:
 
 Uses narrowest-FOV front camera (largest focal length) to avoid ultra-wide selfie cameras. Calculates horizontal FOV from focal length and sensor physical size.
 
+### Device validation record: 2026-09-19, Pixel 10 Pro, front camera mode
+
+First end-to-end run on real hardware after the 2026-09-19 fixes. **Device:** Pixel 10 Pro.
+**Mode:** front camera. Verified from the device log and from the files pulled off the device:
+
+| Check | Observed | Expected |
+|-------|----------|----------|
+| Derived iris radius | `radius=0.120000005` from a live preview zoom of 1.25 | `MIN_IRIS_SIZE_FRACTION / previewZoom = 0.15 / 1.25 = 0.12`. Matched |
+| Crop axis | `irisR=293.76` from `rawDims=3440x2448` with `effectiveRotation=270` | `0.12 * 2448`, the **short** axis. Matched. Before the axis fix the same frame gave 412.8, because the radius was normalised against the 3440 long axis |
+| Full pipeline | Captured, cropped, scored and saved both JPEG and DNG | Completed without error |
+| Output image | A pulled sample was a correctly framed, in-focus **705x705** eye crop | A usable crop centred on the iris |
+
+**Motion blur: the first empirical data point.** Genuine in-focus captures scored **92.0 to 93.9**
+on the motion-blur sub-score. Inverting the score mapping in section 17
+(`score = (1 - (d - 1) / (2 * (T - 1))) * 100`, with `T = MOTION_BLUR_THRESHOLD = 6.0`) puts the
+measured directionality `d` at roughly **1.6 to 1.8**, well below the provisional threshold. This
+is the first real evidence that the corrected metric moves off its 1.0 isotropic floor and that
+good captures sit near the bottom of its range, which is what the correction was meant to achieve.
+**It does not calibrate the threshold.** It fixes only a lower anchor. An upper bound still has to
+be established from deliberately blurred frames (for example by panning the device during the
+exposure), so that the separation between acceptable and rejected directionality is measured rather
+than guessed. Until that is done, `MOTION_BLUR_THRESHOLD = 6.0` remains provisional (limitation 11).
+
+**Scope.** One device, one mode, one session. Nothing here validates the rear telephoto or main
+camera paths, the rewritten usable-iris metric, or any threshold other than the lower anchor noted
+above.
+
+**This run predates the double-zoom fix.** It was taken before the commit that stopped `setZoom()`
+applying the zoom twice (`CONTROL_ZOOM_RATIO` and then a second narrowing of
+`SCALER_CROP_REGION`), which meant the still was magnified by `z * z` while the radius derivation
+read back `z`. The two arithmetic checks above are unaffected, because they are arithmetic on
+values taken straight from the log (`0.15 / 1.25 = 0.12`, and `0.12 * 2448 = 293.76`). The
+**framing** observation is not: the 705x705 crop was produced under the doubled magnification, so
+the on-device framing and the comfortable standoff distance need re-confirming in each mode now
+that zoom is expressed once.
+
 ---
 
 ## 24. Configuration Constants Reference
@@ -1040,12 +1311,12 @@ Uses narrowest-FOV front camera (largest focal length) to avoid ultra-wide selfi
 
 | Constant | Value | Description |
 |----------|-------|-------------|
-| `TARGET_ISO_MIN` | 100 | Minimum ISO for lowest noise |
-| `TARGET_ISO_MAX` | 400 | Maximum ISO to limit noise |
-| `MIN_SHUTTER_SPEED_NS` | 4,000,000 (1/250s) | Fastest shutter speed |
-| `MAX_SHUTTER_SPEED_NS` | 8,000,000 (1/125s) | Slowest acceptable shutter |
-| `FOCUS_LOCK_TIMEOUT_MS` | 2000 | Max time for focus lock |
-| `FOCUS_RETRY_COUNT` | 2 | AF retries before proceeding |
+| `TARGET_ISO_MIN` | 100 | **Log-only.** Intended minimum ISO. `SENSOR_SENSITIVITY` is never set, so this is computed solely to appear in a `SENSOR_CONTROL` log line |
+| `TARGET_ISO_MAX` | 400 | **Log-only**, as above |
+| `MIN_SHUTTER_SPEED_NS` | 4,000,000 (1/250s) | **Log-only.** `SENSOR_EXPOSURE_TIME` is never set |
+| `MAX_SHUTTER_SPEED_NS` | 8,000,000 (1/125s) | **Log-only**, as above |
+| `FOCUS_LOCK_TIMEOUT_MS` | 3000 | Max time for focus lock (this table previously said 2000) |
+| `FOCUS_RETRY_COUNT` | 3 | AF retries before proceeding (this table previously said 2) |
 | `AF_METERING_FRACTION` | 12 (1/12 = ~8%) | Standard metering region |
 | `AF_METERING_FRACTION_TELEPHOTO` | 16 (1/16 = ~6%) | Telephoto metering region |
 | `MIN_IRIS_SIZE_FRACTION` | 0.15 | On-screen iris target radius; also the numerator of the iris radius derivation (section 9) |
@@ -1073,8 +1344,8 @@ Uses narrowest-FOV front camera (largest focal length) to avoid ultra-wide selfi
 |----------|-------|-------------|
 | `FLASH_STABILIZATION_DELAY_MS` | 150 | Time after flash before capture |
 | `POST_FLASH_CAPTURE_DELAY_MS` | 50 | Brief delay post-flash |
-| `USE_OIS_FOR_TELEPHOTO` | true | Enable OIS for telephoto |
-| `DISABLE_ISP_FOR_TELEPHOTO` | true | Bypass ISP processing |
+| `USE_OIS_FOR_TELEPHOTO` | true | Gates `LENS_OPTICAL_STABILIZATION_MODE_ON` on the **preview** request only. The still request carries no OIS key |
+| `DISABLE_ISP_FOR_TELEPHOTO` | true | **Orphaned constant: referenced nowhere.** The ISP bypass it used to gate lived on the deleted `takePicture` path, so it has never been applied to a saved image (sections 9 and 26) |
 
 ### Eye Presence Detection
 
@@ -1092,8 +1363,11 @@ Uses narrowest-FOV front camera (largest focal length) to avoid ultra-wide selfi
 
 | Constant | Value | Description |
 |----------|-------|-------------|
-| `USABLE_IRIS_THRESHOLD` | 0.50 | Rear camera usable iris minimum |
-| `USABLE_IRIS_THRESHOLD_FRONT` | 0.35 | Front camera usable iris minimum |
+| `USABLE_IRIS_THRESHOLD` | 0.50 | Rear camera minimum **unoccluded** annulus fraction. Unchanged in value, changed in meaning by the 2026-09-19 rewrite (section 17) |
+| `USABLE_IRIS_THRESHOLD_FRONT` | 0.35 | Front camera equivalent. **The front/rear split predates the rewrite and should be re-examined:** occlusion is not a property of which camera took the picture |
+| `USABLE_IRIS_SPECULAR_CUTOFF` | 250 | At or above this luma a sample counts as glare. **Reasoned, not empirically tuned** |
+| `USABLE_IRIS_DEVIATION_K` | 2.5 | Robust sigmas away from the annulus median before a sample counts as occluded. **Reasoned, not empirically tuned** |
+| `USABLE_IRIS_MIN_SIGMA` | 4.0 | Floor on the robust sigma, so a nearly flat crop does not flag every sample. **Reasoned, not empirically tuned** |
 | `PUPIL_RATIO_MIN` / `MAX` | 0.20 / 0.70 | Valid pupil-to-iris ratio range |
 | `CONTRAST_THRESHOLD` | 0.40 | Minimum iris-pupil contrast |
 | `UNIFORMITY_THRESHOLD` | 0.50 | Minimum illumination uniformity |
@@ -1103,6 +1377,8 @@ Uses narrowest-FOV front camera (largest focal length) to avoid ultra-wide selfi
 | `COMPOSITE_PASS_THRESHOLD` | 40 | Minimum weighted composite score |
 
 `GAZE_DISPLACEMENT_THRESHOLD` (0.25) was deleted on 2026-09-19 with the Gaze Angle metric.
+`IRIS_INTENSITY_THRESHOLD_REAR` (180) and `IRIS_INTENSITY_THRESHOLD_FRONT` (220) were deleted on
+the same date with the darkness-counting usable-iris metric they belonged to (section 17).
 
 ---
 
@@ -1169,7 +1445,7 @@ Uses narrowest-FOV front camera (largest focal length) to avoid ultra-wide selfi
 
 3. **Eye presence detector tuning:** The composite threshold (0.28) and geometric veto threshold (0.10) may need adjustment for specific capture conditions (e.g., very dark environments, extreme close-up distances).
 
-4. **No eyelid landmark detection:** Since MediaPipe was removed, the quality assessor uses the intensity-based fallback for usable iris area estimation instead of precise eyelid polylines. The landmark path in `computeUsableIrisArea()` is retained but is never taken, because `EyeImageCropper` always passes null eyelid point lists. The Gaze Angle metric depended entirely on those landmarks and was removed on 2026-09-19 rather than left returning a constant (see section 17).
+4. **No eyelid landmark detection:** Since MediaPipe was removed, the quality assessor uses the intensity-based fallback for usable iris area estimation instead of precise eyelid polylines. The landmark path in `computeUsableIrisArea()` is retained but is never taken, because `EyeImageCropper` always passes null eyelid point lists. That fallback was rewritten on 2026-09-19 to measure occlusion relative to the iris's own intensity distribution instead of counting dark pixels (see section 17 and limitation 13). The Gaze Angle metric depended entirely on those landmarks and was removed on 2026-09-19 rather than left returning a constant (see section 17).
 
 5. **Front camera limitations:** No flash available, lower sharpness thresholds, wider contrast tolerance. Front camera images are inherently lower quality than rear cameras for iris capture.
 
@@ -1177,28 +1453,35 @@ Uses narrowest-FOV front camera (largest focal length) to avoid ultra-wide selfi
 
 7. **RAW not available on all lenses:** Some physical camera IDs (especially telephoto on certain devices) may not support RAW_SENSOR format. The app gracefully falls back to JPEG-only.
 
-8. **Session timeout is absolute:** The `totalSessionTimeoutMs` covers both eyes combined, so a slow right-eye session may leave insufficient time for the left eye.
+8. **There is no session timeout:** Earlier revisions of this document described a `totalSessionTimeoutMs` bounding the whole session. **No such constant or elapsed-time check exists in `CameraFragment`** (the only timeout in the file is `FOCUS_LOCK_TIMEOUT_MS`, which bounds one autofocus wait). A session is bounded only by the per-eye attempt cap (`MAX_CAPTURE_ATTEMPTS_PER_EYE`, 30, applied separately to each eye, so up to 60 attempts in total) and by the operator pressing Stop. A participant who cannot hold alignment will therefore keep the session running until the attempt caps are exhausted rather than being cut off on time. If a wall-clock bound is wanted for a collection protocol, it has to be added. See section 12.
 
-9. **Package name is legacy:** The package `com.google.mediapipe.examples.facelandmarker` was inherited from the original TensorFlow/MediaPipe codebase. All ML dependencies have been removed, but the package name was retained for compatibility.
+9. **Package name: resolved 2026-09-19.** The inherited package `com.google.mediapipe.examples.facelandmarker` was renamed throughout to `edu.clarkson.iriscapture`, together with the application ID, the manifest, the navigation graph, the layouts and the tests. This limitation is closed and is kept here only so the change is discoverable from where it used to be described. Two upstream names still survive in observable behaviour and are deliberately unchanged: the `Pictures/FaceLandmarker` output album and the EXIF `Software` tag value.
 
 10. **Portrait mode only:** All capture modes currently force portrait orientation. The landscape mode constants (`USE_LANDSCAPE_FOR_*`) are all set to `false`.
 
-11. **`MOTION_BLUR_THRESHOLD` is provisional:** The corrected motion-blur metric now spans 1.0 to 36.0, but its threshold of 6.0 is a reasoned starting point rather than a measured one. The previous value could not be carried over, because the formula it was chosen against returned roughly 1.0 for every image, so no historical baseline exists. It must be re-tuned against a real capture set before the metric is trusted.
+11. **`MOTION_BLUR_THRESHOLD` is provisional:** The corrected motion-blur metric now spans 1.0 to 36.0, but its threshold of 6.0 is a reasoned starting point rather than a measured one. The previous value could not be carried over, because the formula it was chosen against returned roughly 1.0 for every image, so no historical baseline exists. The 2026-09-19 device run (section 23) supplies the first empirical data point: genuine in-focus front-camera captures scored 92.0 to 93.9, which inverts to a directionality of roughly 1.6 to 1.8. That anchors the good-capture end of the scale, but it establishes no upper bound. Deliberately blurred frames are still needed before the threshold can be called anything but provisional.
 
-12. **The derived iris radius needs device validation:** The normalized iris radius is now computed from the live preview zoom (section 9) instead of per-mode literals. The derivation is sound, but the resulting values have not yet been confirmed against real captures, and they moved substantially on two modes (telephoto on a physical lens, 0.06 to 0.15, and front camera, 0.05 to 0.12).
+12. **The derived iris radius is validated on the front camera only:** The normalized iris radius is now computed from the live preview zoom (section 9) instead of per-mode literals. On 2026-09-19 the front-camera path was confirmed on a Pixel 10 Pro (`radius=0.120000005` at a preview zoom of 1.25, and a 705x705 crop that framed the iris correctly; see the device validation record in section 23). The rear telephoto and main-camera values are still unconfirmed, and telephoto on a physical lens moved substantially (0.06 to 0.15), so that mode in particular should be checked on a device before its scores are used.
+
+13. **The rewritten usable-iris metric is untuned and degrades above 50 percent occlusion:** The live usable-iris path (section 17) now judges occlusion relative to the iris's own median and robust sigma rather than against an absolute intensity, which makes it independent of iris colour and of overall exposure. Two caveats follow from that design. First, **if more than half of the annulus is occluded the median describes the occluder rather than the iris**, so the metric over-reports usability exactly when the image is worst; heavy occlusion has to be caught by the eye-presence detector and the contrast metric instead. Second, `USABLE_IRIS_SPECULAR_CUTOFF` (250), `USABLE_IRIS_DEVIATION_K` (2.5) and `USABLE_IRIS_MIN_SIGMA` (4.0) are reasoned starting points, not empirically tuned values. Separately, the pass thresholds `USABLE_IRIS_THRESHOLD` (0.50) and `USABLE_IRIS_THRESHOLD_FRONT` (0.35) now mean "fraction unoccluded" rather than "fraction dark", and the front/rear split they encode should be re-examined, because occlusion does not depend on which camera took the picture.
+
+14. **OPEN ITEM, flagged for decision: no capture-side image tuning has ever been applied.** The telephoto ISP bypass (`EDGE_MODE_OFF`, `NOISE_REDUCTION_MODE_OFF`, `SHADING_MODE_OFF`, hot pixel), the capture-side OIS enable, the AE and flash copying, and the manual ISO and exposure-time settings all lived in `applyCommonCaptureSettings()` and `applyOptimalExposureSettings()`, which were reachable only from the `takePicture` chain. That chain was unreachable and was deleted on 2026-09-19. **Consequently every image this application has ever saved was produced with full ISP processing, including denoising and edge enhancement, with OIS set only on the preview, and with the camera's own auto-exposure rather than the intended ISO and shutter targets.** For a study of iris texture this is material: denoising and edge enhancement alter exactly the high-frequency detail such a study measures, and it applies retrospectively to data already collected, not only to future captures. `DISABLE_ISP_FOR_TELEPHOTO` is now an orphaned constant and the ISO and shutter constants are log-only. Whether to restore any of this to the live still path is a research decision that this document does not make; it is recorded here so the decision is made deliberately rather than by default. See sections 9, 11, 22 and 24.
+
+15. **Timing optimizations described in earlier revisions are not in the code:** The February 2026 capture-timing work (adaptive alignment delay, skipped focus settle on subsequent attempts, a 2000 ms focus timeout with 2 retries, a 500 ms inter-attempt delay) is absent from the current source, which uses a flat 4000 ms alignment delay on every attempt, a 1500 ms focus settle, a 3000 ms timeout with 3 retries and a 2000 ms inter-attempt delay. It appears to have been lost with the working tree rather than deliberately reverted. Fixed delays alone therefore come to roughly 7.7 seconds per attempt. See sections 13 and 22.
 
 ---
 
 ## 27. Changelog
 
-### 2026-09-19: four quality-metric defects fixed
+### 2026-09-19: quality-metric defects fixed, usable-iris metric rewritten, pipeline repairs
 
-All four defects were verified against the source before being fixed. **Composite quality scores
+Every defect below was verified against the source before being fixed. **Composite quality scores
 produced before this date are not comparable with those produced after it:** the Gaze Angle
-metric's fixed +7.0 contribution is gone, every remaining weight scales by 1/0.9, and the
-motion-blur sub-score now varies across its full range instead of sitting in a compressed band.
-Quality figures recorded in filenames (`Q{score}`) and in EXIF metadata carry no marker of which
-scale they were produced on, so date the capture session to tell them apart.
+metric's fixed +7.0 contribution is gone, every remaining weight scales by 1/0.9, the motion-blur
+sub-score now varies across its full range instead of sitting in a compressed band, and the
+usable-iris sub-score, which used to saturate at 100.0 on dark irides, now varies with actual
+occlusion. Quality figures recorded in filenames (`Q{score}`) and in EXIF metadata carry no marker
+of which scale they were produced on, so date the capture session to tell them apart.
 
 1. **Gaze Angle removed; six metrics remain, not seven.** `computeGazeAngle()` returned a
    hard-coded `0.15f` whenever eyelid landmarks were absent, and `EyeImageCropper` always passes
@@ -1233,3 +1516,107 @@ scale they were produced on, so date the capture session to tell them apart.
    zooms. Corrected values: telephoto on a physical lens 0.06 to 0.15, front camera 0.05 to 0.12,
    zoom-based telephoto 0.06 to 0.05, `MAIN_8X` unchanged at 0.0375, and fallback devices now
    track `maxZoom` instead of a fixed literal. See section 9.
+
+5. **Usable iris area rewritten: it measured darkness, not occlusion.** The intensity fallback,
+   which is the only path that ever runs, counted annulus samples below a fixed absolute intensity
+   (180 rear, 220 front) and returned that fraction. On a dark iris every sample fell below the
+   threshold, so the metric returned exactly 1.0 no matter how much eyelid covered the iris; it was
+   confirmed saturating on a real device (`darkCount=180 totalCount=180 ratio=1.0`, score 100.0) on
+   a **critical** gate, meaning that gate carried no information and could never reject anything.
+   The same rule would have failed a light blue or grey iris for being correctly exposed. The
+   metric now derives a robust centre (median) and spread (MAD scaled by 1.4826, floored at
+   `USABLE_IRIS_MIN_SIGMA`) from the annulus samples themselves and counts a sample as occluded
+   when it departs from the iris's own distribution: brighter than `median + k*sigma` (eyelid skin
+   or sclera), darker than `median - k*sigma` (eyelash or shadow), or at/above
+   `USABLE_IRIS_SPECULAR_CUTOFF` (glare). It returns `1 - occludedFraction`, so it now behaves the
+   same way for any iris colour. New constants `USABLE_IRIS_SPECULAR_CUTOFF = 250`,
+   `USABLE_IRIS_DEVIATION_K = 2.5f` and `USABLE_IRIS_MIN_SIGMA = 4.0f`, all reasoned rather than
+   tuned; `IRIS_INTENSITY_THRESHOLD_REAR` and `IRIS_INTENSITY_THRESHOLD_FRONT` deleted. Known
+   limitation: above 50 percent occlusion the median describes the occluder and the metric
+   over-reports usability. The pass thresholds (0.50 rear, 0.35 front) now mean "fraction
+   unoccluded" and their front/rear split should be re-examined. See section 17 and limitation 13.
+
+6. **Iris radius was normalised against the wrong image axis.** `EyeImageCropper` chose the axis to
+   scale the normalized radius by from `exifDegrees`, while the cropped bitmap is rotated by
+   `effectiveRotation`. Those two always differ by 90 degrees, so the radius was normalised against
+   an axis the crop is never rendered in. On the live path `JPEG_ORIENTATION` is never set, so
+   `exifDegrees` was always 0 and the sensor **long** axis was used, inflating every radius by the
+   frame aspect ratio. The axis is now selected from `effectiveRotation`. Verified on a device the
+   same day: `irisR=293.76` from `rawDims=3440x2448` at `effectiveRotation=270`, which is
+   `0.12 * 2448` (the short axis), where the pre-fix code gave 412.8 off the 3440 axis. See
+   section 23.
+
+7. **Login validation restored; the app could not get past its first screen.** `LoginFragment`
+   required a **6**-digit participant ID while `fragment_login.xml` caps that field at
+   `maxLength="3"`, so the ENTER button could never succeed and no session could start. The check
+   is back to exactly 3 digits, matching the layout. The images-per-eye field, which the broken
+   build ignored entirely, is validated again (integer, 1 to 20) and stored on `MainViewModel`.
+   Note that storing it is all that happens: `CameraFragment` still does not read it, so the
+   capture loop remains fixed at 5 accepted images per eye. See section 6.
+
+8. **Eye-presence gate wired into the capture pipeline.** `EyePresenceDetector` existed and was
+   documented (section 15) but was not actually invoked. `processAndCropCenterBased()` now calls
+   `EyePresenceDetector.detect()` on the cropped eye image, between the crop and the sharpness
+   measurement, and rejects the attempt when no eye is detected, so quality assessment no longer
+   runs on frames containing no eye. The call is wrapped in a `try/catch` because `detect()`
+   allocates two int arrays the size of the whole crop and an uncaught OOM there would leak the
+   bitmap and abort the session. The rejection behaviour is a best-faith reconstruction of the
+   pre-loss build and should be reviewed against intended behaviour. See section 15.
+
+9. **Package renamed to `edu.clarkson.iriscapture`.** The inherited
+   `com.google.mediapipe.examples.facelandmarker` was replaced throughout: sources, application ID,
+   manifest, navigation graph, layouts and tests. Long-standing limitation 9 is closed by this.
+   Two upstream names deliberately survive in observable behaviour and were **not** changed,
+   because renaming them would change where images land and what existing files claim about
+   themselves: the `Pictures/FaceLandmarker` output album and the EXIF `Software` tag value.
+
+10. **Camera2 zoom was applied twice.** `setZoom()` set `CONTROL_ZOOM_RATIO` and then also narrowed
+    `SCALER_CROP_REGION` to `activeArray / z`. Once the zoom ratio is non-unity the crop region is
+    interpreted in post-zoom coordinates, so a conforming HAL read that as a second z-fold crop and
+    effective magnification became `z * z` (4x asked for, 16x delivered). The ratio path now pins
+    the crop region to the full active array, so zoom is expressed exactly once; the legacy
+    sub-API-30 path, which correctly zooms by crop region alone, is unchanged. This also made the
+    iris-radius derivation self-consistent, since it reads `CONTROL_ZOOM_RATIO` back and was
+    getting `z` while the still was magnified by `z * z`, leaving every crop radius wrong by a
+    further factor of `z`. **Expect the preview to look less magnified than before, and confirm the
+    on-screen target is still fillable at a comfortable standoff in each mode.** Any radius, crop
+    size or quality figure measured on a device before this fix needs re-measuring. See sections 9
+    and 11.
+
+11. **The left eye was captured at a different zoom from the right.** Between eyes the telephoto
+    branch called `unlock3AAndZoomOutTo1x(keepZoom = false)`, which reset zoom to 1x with nothing
+    re-applying it, so the right eye was captured at 3x and the left at 1x against an unchanged
+    on-screen alignment target. The flag had been tied to `USE_LANDSCAPE_FOR_TELEPHOTO`, a screen
+    orientation constant unrelated to zoom. It now passes `keepZoom = true`, matching the `MAIN_8X`
+    and `FRONT` branch; the 3A reset that is the real purpose of the call is preserved, and the
+    end-of-session reset to 1x still happens in `resetAfterCapture()`. **Any telephoto data
+    collected before 2026-09-19 has mismatched left and right eyes and should be treated as
+    such.** See section 12.
+
+12. **Motion-blur degenerate cases no longer score a free 100.** A crop too small to measure
+    (ROI under 5 by 5) or with no gradient above the magnitude floor returned the isotropic floor,
+    which mapped to a perfect 100 on a metric worth a sixth of the composite, so a blank or
+    blown-out crop was rewarded for having nothing to measure. Both now return
+    `MOTION_BLUR_THRESHOLD`, a neutral 50. Rejecting such a crop is the sharpness metric's job.
+    See section 17.
+
+13. **Dead code removed, and what that revealed.** The whole `takePicture` chain was deleted after
+    its unreachability was established, and with it `applyCommonCaptureSettings()`,
+    `applyOptimalExposureSettings()` and `captureIrisNormX/Y/Radius`; also `captureIsRightEye`,
+    `USE_SEQUENTIAL_CAPTURE`, a private `calculateSharpness` overload and `SharpnessAnalyzer`'s
+    unused `ByteArray` overload. Two consequences are **pre-existing rather than introduced by the
+    deletion**, because the deleted code never ran on the live path: `CaptureRequest.JPEG_ORIENTATION`
+    is now set nowhere, so stills carry EXIF orientation 0 structurally (section 14); and the
+    telephoto ISP bypass, capture-side OIS, AE/flash copying and manual ISO and exposure settings
+    have never been applied to any saved image, leaving `DISABLE_ISP_FOR_TELEPHOTO` orphaned and
+    the ISO and shutter constants log-only. **That last point is flagged for a research decision
+    and is tracked as limitation 14.** See sections 9, 22 and 24.
+
+14. **Documentation corrected against the source in four further places.** The eye-switch
+    "7-second countdown" does not exist (the gap is a flat 1500 ms with no switch-eyes prompt,
+    section 12); the February 2026 capture-timing optimizations are absent from the code, which
+    still uses a 4000 ms alignment delay on every attempt, a 3000 ms focus timeout and 3 retries,
+    and a 2000 ms inter-attempt delay (sections 13 and 22, limitation 15);
+    `FOCUS_LOCK_TIMEOUT_MS` and `FOCUS_RETRY_COUNT` were listed as 2000 and 2 but are 3000 and 3
+    (section 24); and "full manual control over focus, exposure, ISO and OIS" in section 1
+    overstated what is applied.
