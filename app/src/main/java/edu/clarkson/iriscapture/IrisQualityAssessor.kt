@@ -80,8 +80,11 @@ object IrisQualityAssessor {
     private const val MOTION_BLUR_ISOTROPIC = 1.0f
 
     // Intensity thresholds for usable iris detection (intensity-based fallback)
-    private const val IRIS_INTENSITY_THRESHOLD_REAR = 180    // Dark iris expected with flash
-    private const val IRIS_INTENSITY_THRESHOLD_FRONT = 220   // Brighter iris without flash
+    // Usable-iris occlusion detection (rewritten 2026-09-19). The old absolute intensity
+    // thresholds (180 rear / 220 front) were removed with the darkness-counting metric.
+    private const val USABLE_IRIS_SPECULAR_CUTOFF = 250   // near-saturated: glare hides texture
+    private const val USABLE_IRIS_DEVIATION_K = 2.5f      // robust sigmas before a sample is occluded
+    private const val USABLE_IRIS_MIN_SIGMA = 4.0f        // floor, so a flat crop does not flag everything
 
     /**
      * Perform full iris quality assessment on a cropped eye image.
@@ -357,6 +360,30 @@ object IrisQualityAssessor {
      *                      since there's no flash and iris appears brighter under ambient light.
      *                      Rear cameras with flash use lower threshold (180) for darker iris.
      */
+    /**
+     * Fraction of the iris annulus that is usable iris texture, i.e. not occluded by
+     * eyelid, eyelashes or specular glare.
+     *
+     * REWRITTEN 2026-09-19. The previous version counted samples below a fixed absolute
+     * intensity and returned that fraction, which measured pixel darkness rather than
+     * occlusion. On a dark iris every sample fell below the threshold so it returned
+     * exactly 1.0 however much eyelid was covering the iris, while a light iris would have
+     * been failed on a critical gate for being correctly exposed. Confirmed saturating on
+     * a real device: darkCount=180, totalCount=180, ratio=1.0.
+     *
+     * This version is adaptive. It derives a robust centre (median) and spread (MAD) from
+     * the iris own intensity distribution, then counts a sample as occluded when it departs
+     * from that distribution: much brighter than the iris (eyelid skin or sclera), much
+     * darker (eyelash or deep shadow), or near-saturated (glare). Because the reference is
+     * the iris itself, the metric behaves the same way for any iris colour.
+     *
+     * KNOWN LIMITATION: if more than half the annulus is occluded, the median describes the
+     * occluder rather than the iris and this will over-report usability. Occlusion that
+     * heavy should be caught by the eye-presence detector and by the contrast metric.
+     *
+     * The deviation multiplier and specular cutoff are reasoned starting points, NOT
+     * empirically tuned. Validate them against real captures before trusting this gate.
+     */
     private fun computeUsableIrisAreaIntensity(
         bitmap: Bitmap,
         irisCenter: PointF,
@@ -366,43 +393,61 @@ object IrisQualityAssessor {
         val pupilRadius = irisRadius * 0.4f
         val numAngles = 36
         val numRadii = 5
-        var darkCount = 0  // Iris-like intensity
-        var totalCount = 0
-
         val width = bitmap.width
         val height = bitmap.height
 
-        // Front camera without flash: iris appears brighter, use higher threshold
-        // Rear camera with flash: iris appears darker with good contrast, use lower threshold
-        val intensityThreshold = if (isFrontCamera) IRIS_INTENSITY_THRESHOLD_FRONT else IRIS_INTENSITY_THRESHOLD_REAR
-
+        // Pass 1: collect the annulus samples (same geometry as before, so radii and angle
+        // counts stay comparable with previously logged values).
+        val samples = ArrayList<Int>(numAngles * numRadii)
         for (ai in 0 until numAngles) {
             val angle = (ai.toFloat() / numAngles) * 2f * Math.PI.toFloat()
             for (ri in 1..numRadii) {
                 val r = pupilRadius + (irisRadius - pupilRadius) * (ri.toFloat() / numRadii)
                 val px = (irisCenter.x + r * cos(angle)).toInt()
                 val py = (irisCenter.y + r * sin(angle)).toInt()
-
                 if (px < 0 || px >= width || py < 0 || py >= height) continue
-
-                totalCount++
                 val pixel = bitmap.getPixel(px, py)
                 val gray = ((pixel shr 16 and 0xFF) * 0.299 +
                         (pixel shr 8 and 0xFF) * 0.587 +
                         (pixel and 0xFF) * 0.114).toInt()
-
-                // Iris region is typically darker than skin and not specular (< 242)
-                // Threshold varies: 180 for rear (flash), 220 for front (no flash)
-                if (gray < intensityThreshold) {
-                    darkCount++
-                }
+                samples.add(gray)
             }
         }
 
-        Log.d(TAG, "USABLE_IRIS_INTENSITY: isFront=$isFrontCamera threshold=$intensityThreshold " +
-                "darkCount=$darkCount totalCount=$totalCount ratio=${if (totalCount > 0) darkCount.toFloat() / totalCount else 0f}")
+        if (samples.size < 20) {
+            Log.d(TAG, "USABLE_IRIS: only ${samples.size} in-bounds samples, returning neutral 0.5")
+            return 0.5f
+        }
 
-        return if (totalCount > 0) darkCount.toFloat() / totalCount else 0.5f
+        // Pass 2: robust centre and spread of the iris own distribution.
+        val sorted = samples.sorted()
+        val median = sorted[sorted.size / 2]
+        val deviations = sorted.map { abs(it - median) }.sorted()
+        val mad = deviations[deviations.size / 2].toFloat()
+        // 1.4826 converts a median absolute deviation into a standard-deviation equivalent.
+        val robustSigma = maxOf(mad * 1.4826f, USABLE_IRIS_MIN_SIGMA)
+        val band = USABLE_IRIS_DEVIATION_K * robustSigma
+
+        // Pass 3: classify departures from the iris distribution as occlusion.
+        var occludedBright = 0   // eyelid skin or sclera
+        var occludedDark = 0     // eyelash or deep shadow
+        var occludedSpecular = 0 // glare
+        for (gray in samples) {
+            when {
+                gray >= USABLE_IRIS_SPECULAR_CUTOFF -> occludedSpecular++
+                gray > median + band -> occludedBright++
+                gray < median - band -> occludedDark++
+            }
+        }
+
+        val occluded = occludedBright + occludedDark + occludedSpecular
+        val usable = 1f - occluded.toFloat() / samples.size
+
+        Log.d(TAG, "USABLE_IRIS: samples=${samples.size} median=$median mad=$mad " +
+                "sigma=$robustSigma band=$band occluded=$occluded (bright=$occludedBright " +
+                "dark=$occludedDark specular=$occludedSpecular) usable=$usable isFront=$isFrontCamera")
+
+        return usable.coerceIn(0f, 1f)
     }
 
     // ========================================================================
@@ -661,8 +706,10 @@ object IrisQualityAssessor {
 
         val roiW = roiRight - roiLeft
         val roiH = roiBottom - roiTop
-        // Too small to measure, assume the best case (perfectly isotropic).
-        if (roiW < 5 || roiH < 5) return MOTION_BLUR_ISOTROPIC
+        // Too small to measure. Return the threshold rather than the isotropic floor:
+        // "cannot tell" must not be rewarded with a perfect score on a metric that
+        // contributes 1/6 of the composite (changed 2026-09-19).
+        if (roiW < 5 || roiH < 5) return MOTION_BLUR_THRESHOLD
 
         // Get pixels and convert to grayscale
         val pixels = IntArray(roiW * roiH)
@@ -711,7 +758,11 @@ object IrisQualityAssessor {
         // Range: 1.0 (all bins equal, isotropic) .. numBins (one bin holds
         // everything, perfectly directional).
         val meanValue = histogram.average().toFloat()
-        if (meanValue <= 0f) return MOTION_BLUR_ISOTROPIC  // No gradients = uniform = ok
+        // No gradient anywhere above the magnitude floor. That is a blown-out, blank or
+        // defocused crop, not evidence of a motion-free capture, so return the threshold
+        // (a neutral score) rather than the isotropic floor (a perfect score). Sharpness
+        // is the metric that should reject such a crop (changed 2026-09-19).
+        if (meanValue <= 0f) return MOTION_BLUR_THRESHOLD
 
         val peakValue = histogram.maxOrNull() ?: 0f
 

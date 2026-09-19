@@ -42,7 +42,6 @@ import android.hardware.camera2.CameraCaptureSession
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraDevice
 import android.hardware.camera2.CameraManager
-import android.hardware.camera2.CameraMetadata
 import android.hardware.camera2.CaptureRequest
 import android.hardware.camera2.CaptureResult
 import android.hardware.camera2.DngCreator
@@ -130,7 +129,6 @@ class CameraFragment : Fragment() {
         private const val MAX_SHUTTER_SPEED_NS = 8_000_000L   // 1/125s = 8ms = 8,000,000 ns
         private const val FOCUS_LOCK_TIMEOUT_MS = 3000L       // Max time to wait for focus lock
         private const val FOCUS_RETRY_COUNT = 3               // Number of focus retries before proceeding
-        private const val USE_SEQUENTIAL_CAPTURE = true       // Use sequential instead of burst (more compatible)
 
         // AF Metering region size (fraction of frame)
         private const val AF_METERING_FRACTION = 12           // 1/12 = ~8% of frame (was 1/4 = 25%)
@@ -261,11 +259,6 @@ class CameraFragment : Fragment() {
     private val sharpnessThreshold: Double
         get() = if (isFrontCamera) SHARPNESS_THRESHOLD_FRONT else SHARPNESS_THRESHOLD_REAR
 
-    // Iris coordinates for post-processing (normalized 0-1, in preview/display space)
-    @Volatile private var captureIrisNormX: Float = 0.5f
-    @Volatile private var captureIrisNormY: Float = 0.5f
-    @Volatile private var captureIrisNormRadius: Float = 0.05f
-
     // RAW Buffer Matching
     private val rawResultQueue = TreeMap<Long, TotalCaptureResult>()
     private val rawImageQueue = TreeMap<Long, Image>()
@@ -283,10 +276,6 @@ class CameraFragment : Fragment() {
     @Volatile private var leftEyeQualityCount = 0   // High-quality images saved for left eye
     @Volatile private var rightEyeAttemptCount = 0  // Total capture attempts for right eye
     @Volatile private var leftEyeAttemptCount = 0   // Total capture attempts for left eye
-
-    // Which eye is being captured. Set by performEyeCapture; its only reader was the
-    // burst capture path, removed 2026-09-19 as unreachable. Kept as capture state.
-    @Volatile private var captureIsRightEye: Boolean = true
 
     // Flag to prevent old ImageReader listener from saving during single capture mode
     @Volatile private var isSingleCaptureActive: Boolean = false
@@ -1228,24 +1217,33 @@ class CameraFragment : Fragment() {
             Log.d(TAG, "ZOOM_DEBUG: setZoom called with level=$zoomLevel coerced=$z centerX=$centerX centerY=$centerY maxZoom=$maxZoom")
 
             if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.R && zoomRatioRange != null) {
+                // Express the zoom exactly ONCE, via CONTROL_ZOOM_RATIO.
+                //
+                // Camera2 contract: as soon as CONTROL_ZOOM_RATIO is something other than
+                // 1.0, SCALER_CROP_REGION is interpreted in the POST-zoom coordinate
+                // system. This branch used to also narrow the crop to activeArray / z,
+                // which a HAL that honours both keys reads as a second z-fold crop on top
+                // of the ratio, for an effective magnification of z * z (so 4x asked for,
+                // 16x delivered). The crop region is now pinned to the full active array,
+                // which in post-zoom coordinates means "the whole zoomed field of view",
+                // i.e. no extra crop. Setting it explicitly (rather than leaving it out)
+                // also clears any narrowed rect an earlier request left on this builder,
+                // since previewRequestBuilder is long lived.
+                //
+                // Note that processAndCropCenterBased() derives the iris radius from the
+                // CONTROL_ZOOM_RATIO on this same builder, so it is only correct while the
+                // ratio is the sole expression of zoom.
                 builder.set(CaptureRequest.CONTROL_ZOOM_RATIO, z)
-
-                if (activeArraySize != null) {
-                    val aa = activeArraySize!!
-                    val cropW = (aa.width() / z).toInt()
-                    val cropH = (aa.height() / z).toInt()
-
-                    // Use provided center or default to sensor center
-                    val cx = centerX ?: aa.exactCenterX().toFloat()
-                    val cy = centerY ?: aa.exactCenterY().toFloat()
-
-                    val cropX = (cx - cropW / 2f).toInt().coerceIn(aa.left, aa.right - cropW)
-                    val cropY = (cy - cropH / 2f).toInt().coerceIn(aa.top, aa.bottom - cropH)
-                    val cropRect = Rect(cropX, cropY, cropX + cropW, cropY + cropH)
-                    builder.set(CaptureRequest.SCALER_CROP_REGION, cropRect)
-                    Log.d(TAG, "ZOOM_DEBUG: Set cropRegion=$cropRect for zoom=$z center=($cx, $cy)")
+                activeArraySize?.let { aa ->
+                    builder.set(CaptureRequest.SCALER_CROP_REGION, aa)
                 }
+                Log.d(TAG, "ZOOM_DEBUG: path=CONTROL_ZOOM_RATIO ratio=$z " +
+                        "cropRegion=full active array ${activeArraySize} (no extra crop); " +
+                        "center args ignored on this path (centerX=$centerX centerY=$centerY)")
             } else {
+                // Legacy path (pre API 30, or no zoom ratio range): CONTROL_ZOOM_RATIO does
+                // not exist, so the crop region is the only way to zoom and it is in
+                // ACTIVE ARRAY coordinates. Narrowing it here is correct.
                 val aa = activeArraySize ?: return
                 val cropW = (aa.width() / z).toInt()
                 val cropH = (aa.height() / z).toInt()
@@ -1256,7 +1254,10 @@ class CameraFragment : Fragment() {
                 val cropX = (cx - cropW / 2f).toInt().coerceIn(aa.left, aa.right - cropW)
                 val cropY = (cy - cropH / 2f).toInt().coerceIn(aa.top, aa.bottom - cropH)
 
-                builder.set(CaptureRequest.SCALER_CROP_REGION, Rect(cropX, cropY, cropX + cropW, cropY + cropH))
+                val cropRect = Rect(cropX, cropY, cropX + cropW, cropY + cropH)
+                builder.set(CaptureRequest.SCALER_CROP_REGION, cropRect)
+                Log.d(TAG, "ZOOM_DEBUG: path=SCALER_CROP_REGION (legacy) zoom=$z " +
+                        "cropRegion=$cropRect center=($cx, $cy)")
             }
 
             session.setRepeatingRequest(builder.build(), repeatingPreviewCallback, backgroundHandler)
@@ -1347,8 +1348,21 @@ class CameraFragment : Fragment() {
                         // Capture RIGHT eye until we have enough quality images
                         performQualityCaptureLoop(isRightEye = true, useTelephoto = true)
 
-                        // Keep zoom for telephoto if in landscape mode
-                        unlock3AAndZoomOutTo1x(keepZoom = USE_LANDSCAPE_FOR_TELEPHOTO)
+                        // Between eyes we only want the 3A reset (release AE/AWB locks,
+                        // cancel the AF trigger, clear the AF/AE regions) so the left eye
+                        // gets a fresh focus and metering cycle. The zoom must NOT change:
+                        // the on-screen alignment target is the same size for both eyes, so
+                        // dropping to 1x here would make the participant stand at a
+                        // completely different distance for the left eye (on a zoom-based
+                        // telephoto device, roughly 3x closer, likely inside the minimum
+                        // focus distance). It would also break the iris radius that
+                        // processAndCropCenterBased derives from the applied preview zoom.
+                        // keepZoom was previously tied to USE_LANDSCAPE_FOR_TELEPHOTO, a
+                        // screen-orientation flag that has nothing to do with zoom and is
+                        // false, so the left eye ran at 1x. The MAIN_8X / FRONT branch below
+                        // already passes true. End-of-session reset back to 1x still happens
+                        // in resetAfterCapture(), which calls this with keepZoom = false.
+                        unlock3AAndZoomOutTo1x(keepZoom = true)
                         delay(1500)
 
                         // Capture LEFT eye until we have enough quality images
@@ -1497,8 +1511,6 @@ class CameraFragment : Fragment() {
 
         val focusModeText = if (useManualFocus) "[MANUAL FOCUS]" else "[AUTO FOCUS]"
 
-        captureIsRightEye = isRightEye
-
         withContext(Dispatchers.Main) {
             fragmentCameraBinding.overlay.isTargetingRightEye = isRightEye
 
@@ -1544,21 +1556,9 @@ class CameraFragment : Fragment() {
             showStatus("Focusing on $eyeLabel Eye...")
         }
 
-        // Set center iris coordinates (user aligned to center)
-        captureIrisNormX = 0.5f
-        captureIrisNormY = 0.5f
-        // For center-based cropping, iris should fill a good portion of frame
-        val useCenterCropForRadius = when (captureMode) {
-            MODE_TELEPHOTO -> USE_CENTER_CROP_FOR_TELEPHOTO
-            MODE_MAIN_8X -> USE_CENTER_CROP_FOR_MAIN
-            MODE_FRONT -> USE_CENTER_CROP_FOR_FRONT
-            else -> false
-        }
-        captureIrisNormRadius = if (useCenterCropForRadius) {
-            MIN_IRIS_SIZE_FRACTION * 1.5f  // ~22% of frame for center-based capture
-        } else {
-            0.15f  // Standard radius for MediaPipe mode
-        }
+        // The user aligns the iris to the centre of the on-screen target, so the crop
+        // coordinates are fixed at (0.5, 0.5); processAndCropCenterBased() derives them,
+        // and the radius, at processing time from the applied preview zoom.
 
         // Setup focus - either manual or auto with precise metering region
         try {
@@ -2051,112 +2051,6 @@ class CameraFragment : Fragment() {
         return false
     }
 
-    /**
-     * Apply optimal exposure settings for iris capture.
-     * NOTE: Manual exposure (AE_MODE_OFF) is INCOMPATIBLE with flash/torch.
-     * Camera HAL returns "Broken pipe" error when using manual exposure with flash.
-     * We use auto exposure which properly manages flash timing.
-     */
-    private fun applyOptimalExposureSettings(builder: CaptureRequest.Builder) {
-        // Keep auto exposure mode for flash compatibility
-        // Copy AE mode from preview (which has flash settings)
-        val currentAeMode = previewRequestBuilder?.get(CaptureRequest.CONTROL_AE_MODE)
-        if (currentAeMode != null) {
-            builder.set(CaptureRequest.CONTROL_AE_MODE, currentAeMode)
-        } else {
-            builder.set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON)
-        }
-
-        // Copy flash mode from preview
-        val currentFlashMode = previewRequestBuilder?.get(CaptureRequest.FLASH_MODE)
-        if (currentFlashMode != null) {
-            builder.set(CaptureRequest.FLASH_MODE, currentFlashMode)
-        }
-
-        Log.d(TAG, "EXPOSURE: Auto mode (flash compatible), AE=$currentAeMode, Flash=$currentFlashMode")
-    }
-
-    private fun takePicture(eye: String, number: Int, mode: String) {
-        if (cameraDevice == null || captureSession == null) return
-        try {
-            val captureBuilder = cameraDevice!!.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE)
-
-            imageReader?.surface?.let { captureBuilder.addTarget(it) }
-
-            if (isRawMode && rawImageReader != null) {
-                captureBuilder.addTarget(rawImageReader!!.surface)
-            }
-
-            applyCommonCaptureSettings(captureBuilder)
-
-            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.R && zoomRatioRange != null) {
-                val z = (previewRequestBuilder?.get(CaptureRequest.CONTROL_ZOOM_RATIO) ?: ZOOM_LEVEL_WIDE)
-                    .coerceIn(zoomRatioRange!!.lower, zoomRatioRange!!.upper)
-
-                captureBuilder.set(CaptureRequest.CONTROL_ZOOM_RATIO, z)
-
-                val cropRegion = previewRequestBuilder?.get(CaptureRequest.SCALER_CROP_REGION)
-                Log.d(TAG, "CAPTURE_DEBUG: zoom=$z cropRegion=$cropRegion eye=$eye number=$number")
-
-                cropRegion?.let {
-                    captureBuilder.set(CaptureRequest.SCALER_CROP_REGION, it)
-                }
-            } else {
-                val cropRegion = previewRequestBuilder?.get(CaptureRequest.SCALER_CROP_REGION)
-                Log.d(TAG, "CAPTURE_DEBUG (legacy): cropRegion=$cropRegion eye=$eye number=$number")
-                cropRegion?.let {
-                    captureBuilder.set(CaptureRequest.SCALER_CROP_REGION, it)
-                }
-            }
-
-            val rotation = requireActivity().windowManager.defaultDisplay.rotation
-            captureBuilder.set(CaptureRequest.JPEG_ORIENTATION, getOrientation(rotation))
-
-            val cameraLabel = if (isFrontCamera) "Front" else "Back"
-
-            // Include iris coordinates in filename for post-processing crop
-            // Format: IX{x%}_IY{y%}_IR{radius%} - all as integers 0-100
-            val irisX = (captureIrisNormX * 100).toInt().coerceIn(0, 100)
-            val irisY = (captureIrisNormY * 100).toInt().coerceIn(0, 100)
-            val irisR = (captureIrisNormRadius * 100).toInt().coerceIn(1, 50)
-
-            val filename = "${viewModel.participantId}_${cameraLabel}_${eye}_${number}_${mode}_IX${irisX}_IY${irisY}_IR${irisR}"
-            Log.d(TAG, "CAPTURE_FILENAME: $filename (iris at ${irisX}%,${irisY}% radius ${irisR}%)")
-            captureBuilder.setTag(filename)
-
-            val captureCallback = object : CameraCaptureSession.CaptureCallback() {
-                override fun onCaptureStarted(session: CameraCaptureSession, request: CaptureRequest, timestamp: Long, frameNumber: Long) {
-                    super.onCaptureStarted(session, request, timestamp, frameNumber)
-                    val tag = request.tag as? String
-                    if (tag != null) {
-                        filenameMap[timestamp] = tag
-                    }
-                }
-
-                override fun onCaptureCompleted(
-                    session: CameraCaptureSession,
-                    request: CaptureRequest,
-                    result: TotalCaptureResult
-                ) {
-                    if (isRawMode) {
-                        synchronized(rawResultQueue) {
-                            rawResultQueue[result.get(CaptureResult.SENSOR_TIMESTAMP)!!] = result
-                            checkAndSaveMatchedRaw()
-                        }
-                    }
-                }
-            }
-
-            captureSession?.capture(captureBuilder.build(), captureCallback, backgroundHandler)
-        } catch (e: CameraAccessException) {
-            e.printStackTrace()
-        }
-    }
-
-    private fun takePicture() {
-        takePicture("Manual", 0, "N")
-    }
-
     private fun checkAndSaveMatchedRaw() {
         val matchedTimestamps = rawResultQueue.keys.intersect(rawImageQueue.keys)
         for (ts in matchedTimestamps) {
@@ -2536,81 +2430,6 @@ class CameraFragment : Fragment() {
         )
     }
 
-    private fun applyCommonCaptureSettings(builder: CaptureRequest.Builder) {
-        builder.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_AUTO)
-        builder.set(CaptureRequest.JPEG_QUALITY, 100.toByte())
-
-        // === TELEPHOTO IRIS OPTIMIZATIONS ===
-        if (captureMode == MODE_TELEPHOTO && DISABLE_ISP_FOR_TELEPHOTO) {
-            // Disable aggressive ISP processing to preserve fine iris texture detail
-            // Edge enhancement can create artificial edges that mask real iris patterns
-            builder.set(CaptureRequest.EDGE_MODE, CaptureRequest.EDGE_MODE_OFF)
-
-            // Disable noise reduction to preserve iris micro-texture
-            // Noise reduction smooths fine details which are critical for iris recognition
-            builder.set(CaptureRequest.NOISE_REDUCTION_MODE, CameraMetadata.NOISE_REDUCTION_MODE_OFF)
-
-            // Disable hot pixel correction (minimal impact but ensures raw texture)
-            try {
-                builder.set(CaptureRequest.HOT_PIXEL_MODE, CaptureRequest.HOT_PIXEL_MODE_OFF)
-            } catch (e: Exception) {
-                Log.w(TAG, "HOT_PIXEL_MODE not supported")
-            }
-
-            // Disable lens shading correction for consistent illumination analysis
-            try {
-                builder.set(CaptureRequest.SHADING_MODE, CaptureRequest.SHADING_MODE_OFF)
-            } catch (e: Exception) {
-                Log.w(TAG, "SHADING_MODE not supported")
-            }
-
-            Log.d(TAG, "TELEPHOTO_ISP: Disabled edge enhancement, noise reduction, hot pixel, shading")
-        } else {
-            // Standard settings for non-telephoto modes
-            builder.set(CaptureRequest.EDGE_MODE, CaptureRequest.EDGE_MODE_HIGH_QUALITY)
-            // Use FAST noise reduction mode - it's widely supported across all camera configurations
-            // MINIMAL (3) was causing HAL crashes on Pixel 10 Pro with 8x zoom + burst capture
-            // FAST (1) provides a good balance between noise reduction and texture preservation
-            builder.set(CaptureRequest.NOISE_REDUCTION_MODE, CameraMetadata.NOISE_REDUCTION_MODE_FAST)
-        }
-
-        // === OIS (Optical Image Stabilization) ===
-        // Critical for telephoto macro - even tiny movements cause blur at close range
-        if (USE_OIS_FOR_TELEPHOTO && hasOisSupport && captureMode == MODE_TELEPHOTO) {
-            builder.set(CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE,
-                CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE_ON)
-            Log.d(TAG, "TELEPHOTO_OIS: Enabled optical image stabilization")
-        }
-
-        // Apply optimal exposure settings (low ISO, fast shutter)
-        applyOptimalExposureSettings(builder)
-
-        previewRequestBuilder?.get(CaptureRequest.SCALER_CROP_REGION)?.let {
-            builder.set(CaptureRequest.SCALER_CROP_REGION, it)
-        }
-
-        // Copy Locks
-        previewRequestBuilder?.get(CaptureRequest.CONTROL_AWB_LOCK)?.let {
-            builder.set(CaptureRequest.CONTROL_AWB_LOCK, it)
-        }
-        previewRequestBuilder?.get(CaptureRequest.CONTROL_AE_LOCK)?.let {
-            builder.set(CaptureRequest.CONTROL_AE_LOCK, it)
-        }
-
-        previewRequestBuilder?.get(CaptureRequest.CONTROL_AF_REGIONS)?.let {
-            builder.set(CaptureRequest.CONTROL_AF_REGIONS, it)
-        }
-        previewRequestBuilder?.get(CaptureRequest.CONTROL_AE_REGIONS)?.let {
-            builder.set(CaptureRequest.CONTROL_AE_REGIONS, it)
-        }
-
-        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.R && zoomRatioRange != null) {
-            previewRequestBuilder?.get(CaptureRequest.CONTROL_ZOOM_RATIO)?.let {
-                builder.set(CaptureRequest.CONTROL_ZOOM_RATIO, it)
-            }
-        }
-    }
-
     private fun getOrientation(rotation: Int): Int {
         if (cameraId == null) return 0
         val sensorOrientation = try {
@@ -2942,55 +2761,6 @@ class CameraFragment : Fragment() {
         } finally {
             outputStream?.close()
         }
-    }
-
-    // Laplacian Variance for Sharpness
-    private fun calculateSharpness(bitmap: Bitmap?): Double {
-        if (bitmap == null) return 0.0
-
-        val width = bitmap.width
-        val height = bitmap.height
-        val pixels = IntArray(width * height)
-        bitmap.getPixels(pixels, 0, width, 0, 0, width, height)
-
-        // Convert to Grayscale
-        val grayPixels = IntArray(width * height)
-        for (i in pixels.indices) {
-            val p = pixels[i]
-            val r = (p shr 16) and 0xff
-            val g = (p shr 8) and 0xff
-            val b = p and 0xff
-            // Luminance
-            grayPixels[i] = (0.299 * r + 0.587 * g + 0.114 * b).toInt()
-        }
-
-        // Laplacian Kernel
-
-        var sum = 0.0
-        var sumSq = 0.0
-        var count = 0
-
-        // Convolve
-        for (y in 1 until height - 1) {
-            for (x in 1 until width - 1) {
-                val center = grayPixels[y * width + x]
-                val up = grayPixels[(y - 1) * width + x]
-                val down = grayPixels[(y + 1) * width + x]
-                val left = grayPixels[y * width + (x - 1)]
-                val right = grayPixels[y * width + (x + 1)]
-
-                val lap = up + down + left + right - 4 * center
-
-                sum += lap
-                sumSq += (lap * lap)
-                count++
-            }
-        }
-
-        val mean = sum / count
-        val variance = (sumSq / count) - (mean * mean)
-
-        return variance
     }
 
     private fun initBottomSheetControls() {

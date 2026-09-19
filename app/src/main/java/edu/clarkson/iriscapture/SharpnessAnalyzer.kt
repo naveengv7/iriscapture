@@ -11,37 +11,17 @@
  * Nothing ever called it - its only caller was the burst capture path, which had no
  * reachable entry point - so it was removed along with that path rather than left to
  * look like the metric in use.
+ *
+ * A calculateSharpness(jpegBytes: ByteArray, roiRect: Rect?) overload was removed for
+ * the same reason: nothing in app/src ever called it. The only live entry point is the
+ * Bitmap overload below, called from CameraFragment on the cropped eye image.
  */
 package edu.clarkson.iriscapture
 
 import android.graphics.Bitmap
-import android.graphics.BitmapFactory
 import android.graphics.Rect
 
 object SharpnessAnalyzer {
-
-    /**
-     * Calculate sharpness score using Laplacian variance.
-     * Higher score = sharper image.
-     *
-     * @param jpegBytes JPEG image bytes
-     * @param roiRect Optional region of interest (null = use center 50%)
-     * @return Sharpness score (higher is better)
-     */
-    fun calculateSharpness(jpegBytes: ByteArray, roiRect: Rect? = null): Double {
-        val options = BitmapFactory.Options().apply {
-            // Decode at 1/2 size for better iris detail detection (was 1/4)
-            inSampleSize = 2
-        }
-        val bitmap = BitmapFactory.decodeByteArray(jpegBytes, 0, jpegBytes.size, options)
-            ?: return 0.0
-
-        return try {
-            calculateLaplacianVariance(bitmap, roiRect)
-        } finally {
-            bitmap.recycle()
-        }
-    }
 
     /**
      * Calculate sharpness from a Bitmap.
